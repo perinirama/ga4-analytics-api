@@ -1,0 +1,4 @@
+flask==3.0.0
+google-analytics-data==0.18.4
+google-auth==2.25.2
+gunicorn==21.2.0
