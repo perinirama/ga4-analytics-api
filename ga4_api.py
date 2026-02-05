@@ -9,6 +9,8 @@ from google.analytics.data_v1beta.types import (
 from google.oauth2 import service_account
 import json
 from datetime import datetime, timedelta
+import anthropic
+import os
 
 app = Flask(__name__)
 
@@ -182,6 +184,254 @@ def analyze_ga4():
             },
             "total_pages": len(aggregated),
             "data": list(aggregated.values())
+        })
+    
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "error_type": type(e).__name__
+        }), 500
+
+def analyze_with_claude(ga4_data, claude_api_key, urls=None, context=None):
+    """
+    Send GA4 data to Claude for analysis
+    
+    Args:
+        ga4_data: Dictionary containing GA4 analytics data
+        claude_api_key: Claude API key
+        urls: Optional list of URLs being analyzed
+        context: Optional business context
+    
+    Returns:
+        Claude's analysis as a string
+    """
+    try:
+        client = anthropic.Anthropic(api_key=claude_api_key)
+        
+        # Format the GA4 data nicely
+        data_summary = f"""
+GA4 Analytics Data Summary:
+Date Range: {ga4_data['date_range']['start']} to {ga4_data['date_range']['end']}
+Total Pages Analyzed: {ga4_data['total_pages']}
+
+Page Performance:
+"""
+        
+        for page in ga4_data['data']:
+            data_summary += f"""
+- {page['pagePath']}
+  Sessions: {page['sessions']}
+  Users: {page['totalUsers']}
+  Bounce Rate: {page['bounceRate']:.1%}
+  Avg Session Duration: {page['averageSessionDuration']:.1f}s
+  Engaged Sessions: {page['engagedSessions']}
+"""
+        
+        # Build the prompt
+        prompt = f"""You are a UX and digital marketing analytics expert analyzing website data for a wellness and therapy clinic.
+
+{data_summary}"""
+        
+        if urls:
+            prompt += f"\n\nURLs requested for analysis: {', '.join(urls)}"
+        
+        if context:
+            prompt += f"\n\nBusiness context: {context}"
+        
+        prompt += """
+
+Please provide:
+1. Key findings about user behavior and traffic patterns
+2. 5 specific, actionable recommendations to improve UX and conversions
+3. Any concerning trends or opportunities
+4. Quick wins that could be implemented immediately
+
+Format your response as a clear, professional email report suitable for a marketing manager."""
+        
+        # Call Claude
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        # Extract text from response
+        analysis = message.content[0].text
+        
+        return analysis
+    
+    except Exception as e:
+        return f"Error analyzing with Claude: {str(e)}"
+
+@app.route('/analyze-with-ai', methods=['POST'])
+def analyze_with_ai():
+    """
+    Enhanced endpoint that includes Claude AI analysis
+    
+    Expected JSON payload:
+    {
+        "property_id": "123456789",
+        "credentials": { GA4 service account JSON },
+        "urls": ["https://example.com/page1"],
+        "days_back": 7,
+        "claude_api_key": "sk-ant-...",
+        "context": "Optional business context"
+    }
+    """
+    
+    try:
+        # Get the basic analyze response
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"error": "No JSON payload provided"}), 400
+        
+        # Extract Claude API key
+        claude_api_key = data.get('claude_api_key')
+        if not claude_api_key:
+            return jsonify({"error": "claude_api_key is required for AI analysis"}), 400
+        
+        # Get GA4 data first (reuse the existing logic)
+        property_id = data.get('property_id')
+        credentials_dict = data.get('credentials')
+        urls = data.get('urls', [])
+        days_back = data.get('days_back', 7)
+        context = data.get('context', '')
+        
+        if not property_id or not credentials_dict:
+            return jsonify({"error": "property_id and credentials are required"}), 400
+        
+        # Get GA4 credentials
+        credentials = service_account.Credentials.from_service_account_info(
+            credentials_dict,
+            scopes=['https://www.googleapis.com/auth/analytics.readonly']
+        )
+        
+        # Initialize GA4 client
+        client = BetaAnalyticsDataClient(credentials=credentials)
+        
+        # Calculate date range
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days_back)
+        
+        # Build and run GA4 request
+        request_params = RunReportRequest(
+            property=f"properties/{property_id}",
+            dimensions=[
+                Dimension(name="pagePath"),
+                Dimension(name="deviceCategory"),
+            ],
+            metrics=[
+                Metric(name="sessions"),
+                Metric(name="totalUsers"),
+                Metric(name="bounceRate"),
+                Metric(name="averageSessionDuration"),
+                Metric(name="engagedSessions"),
+            ],
+            date_ranges=[DateRange(
+                start_date=start_date.strftime("%Y-%m-%d"),
+                end_date=end_date.strftime("%Y-%m-%d")
+            )],
+            limit=100
+        )
+        
+        response = client.run_report(request_params)
+        
+        # Format results (same as before)
+        results = []
+        for row in response.rows:
+            result = {
+                "pagePath": row.dimension_values[0].value,
+                "deviceCategory": row.dimension_values[1].value,
+                "sessions": int(row.metric_values[0].value),
+                "totalUsers": int(row.metric_values[1].value),
+                "bounceRate": float(row.metric_values[2].value),
+                "averageSessionDuration": float(row.metric_values[3].value),
+                "engagedSessions": int(row.metric_values[4].value),
+            }
+            results.append(result)
+        
+        # Filter and aggregate (same as before)
+        if urls:
+            from urllib.parse import urlparse
+            url_paths = []
+            for url in urls:
+                if url:
+                    parsed = urlparse(url)
+                    path = parsed.path if parsed.path else '/'
+                    url_paths.append(path)
+            
+            if url_paths:
+                filtered_results = [
+                    r for r in results 
+                    if any(r['pagePath'] == path or r['pagePath'].startswith(path) for path in url_paths)
+                ]
+                results = filtered_results if filtered_results else results
+        
+        # Aggregate by page
+        aggregated = {}
+        for row in results:
+            path = row['pagePath']
+            if path not in aggregated:
+                aggregated[path] = {
+                    "pagePath": path,
+                    "sessions": 0,
+                    "totalUsers": 0,
+                    "bounceRate": 0,
+                    "averageSessionDuration": 0,
+                    "engagedSessions": 0,
+                    "devices": []
+                }
+            
+            aggregated[path]["sessions"] += row["sessions"]
+            aggregated[path]["totalUsers"] += row["totalUsers"]
+            aggregated[path]["engagedSessions"] += row["engagedSessions"]
+            aggregated[path]["devices"].append({
+                "device": row["deviceCategory"],
+                "sessions": row["sessions"]
+            })
+        
+        # Calculate weighted averages
+        for path, data in aggregated.items():
+            total_sessions = data["sessions"]
+            if total_sessions > 0:
+                weighted_bounce = sum(
+                    r["bounceRate"] * r["sessions"] 
+                    for r in results if r["pagePath"] == path
+                )
+                data["bounceRate"] = round(weighted_bounce / total_sessions, 4)
+                
+                weighted_duration = sum(
+                    r["averageSessionDuration"] * r["sessions"] 
+                    for r in results if r["pagePath"] == path
+                )
+                data["averageSessionDuration"] = round(weighted_duration / total_sessions, 2)
+        
+        # Prepare GA4 data for Claude
+        ga4_data = {
+            "property_id": property_id,
+            "date_range": {
+                "start": start_date.strftime("%Y-%m-%d"),
+                "end": end_date.strftime("%Y-%m-%d")
+            },
+            "total_pages": len(aggregated),
+            "data": list(aggregated.values())
+        }
+        
+        # Get Claude analysis
+        ai_insights = analyze_with_claude(ga4_data, claude_api_key, urls, context)
+        
+        # Return combined response
+        return jsonify({
+            "success": True,
+            "property_id": property_id,
+            "date_range": ga4_data["date_range"],
+            "total_pages": len(aggregated),
+            "ga4_data": list(aggregated.values()),
+            "ai_insights": ai_insights
         })
     
     except Exception as e:
