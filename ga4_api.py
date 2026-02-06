@@ -11,11 +11,9 @@ import json
 from datetime import datetime, timedelta
 import anthropic
 import os
-import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend for server
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+import plotly.io as pio
 import base64
-from io import BytesIO
 
 app = Flask(__name__)
 
@@ -273,7 +271,7 @@ Format your response as a clear, professional email report suitable for a market
 
 def generate_charts(ga4_data):
     """
-    Generate charts from GA4 data and return as base64 encoded images
+    Generate charts from GA4 data using Plotly and return as base64 encoded images
     
     Args:
         ga4_data: Dictionary containing GA4 analytics data
@@ -292,37 +290,50 @@ def generate_charts(ga4_data):
         # Truncate long page paths for better display
         pages = [p[:30] + '...' if len(p) > 30 else p for p in pages]
         
-        # Chart 1: Sessions by Page (Bar Chart)
-        fig1, ax1 = plt.subplots(figsize=(10, 6))
-        ax1.barh(pages, sessions, color='#4285F4')
-        ax1.set_xlabel('Sessions', fontsize=12, fontweight='bold')
-        ax1.set_title('Sessions by Page', fontsize=14, fontweight='bold', pad=20)
-        ax1.invert_yaxis()
-        plt.tight_layout()
+        # Chart 1: Sessions by Page (Horizontal Bar Chart)
+        fig1 = go.Figure(data=[
+            go.Bar(
+                y=pages,
+                x=sessions,
+                orientation='h',
+                marker=dict(color='#4285F4')
+            )
+        ])
+        fig1.update_layout(
+            title='Sessions by Page',
+            xaxis_title='Sessions',
+            yaxis=dict(autorange="reversed"),
+            height=400,
+            margin=dict(l=150, r=50, t=80, b=50)
+        )
         
         # Convert to base64
-        buffer1 = BytesIO()
-        plt.savefig(buffer1, format='png', dpi=150, bbox_inches='tight')
-        buffer1.seek(0)
-        charts['sessions_chart'] = base64.b64encode(buffer1.read()).decode()
-        plt.close()
+        img_bytes1 = pio.to_image(fig1, format='png', width=800, height=400)
+        charts['sessions_chart'] = base64.b64encode(img_bytes1).decode()
         
-        # Chart 2: Bounce Rate by Page (Horizontal Bar Chart)
-        fig2, ax2 = plt.subplots(figsize=(10, 6))
+        # Chart 2: Bounce Rate by Page (Horizontal Bar Chart with color coding)
         colors = ['#EA4335' if br > 60 else '#FBBC04' if br > 40 else '#34A853' for br in bounce_rates]
-        ax2.barh(pages, bounce_rates, color=colors)
-        ax2.set_xlabel('Bounce Rate (%)', fontsize=12, fontweight='bold')
-        ax2.set_title('Bounce Rate by Page', fontsize=14, fontweight='bold', pad=20)
-        ax2.invert_yaxis()
-        ax2.axvline(x=50, color='gray', linestyle='--', linewidth=1, alpha=0.5)
-        plt.tight_layout()
+        
+        fig2 = go.Figure(data=[
+            go.Bar(
+                y=pages,
+                x=bounce_rates,
+                orientation='h',
+                marker=dict(color=colors)
+            )
+        ])
+        fig2.update_layout(
+            title='Bounce Rate by Page (%)',
+            xaxis_title='Bounce Rate (%)',
+            yaxis=dict(autorange="reversed"),
+            height=400,
+            margin=dict(l=150, r=50, t=80, b=50)
+        )
+        fig2.add_vline(x=50, line_dash="dash", line_color="gray", opacity=0.5)
         
         # Convert to base64
-        buffer2 = BytesIO()
-        plt.savefig(buffer2, format='png', dpi=150, bbox_inches='tight')
-        buffer2.seek(0)
-        charts['bounce_rate_chart'] = base64.b64encode(buffer2.read()).decode()
-        plt.close()
+        img_bytes2 = pio.to_image(fig2, format='png', width=800, height=400)
+        charts['bounce_rate_chart'] = base64.b64encode(img_bytes2).decode()
         
         # Chart 3: Device Breakdown (Pie Chart)
         device_sessions = {}
@@ -332,18 +343,22 @@ def generate_charts(ga4_data):
                 device_sessions[device_name] = device_sessions.get(device_name, 0) + device['sessions']
         
         if device_sessions:
-            fig3, ax3 = plt.subplots(figsize=(8, 8))
-            colors_pie = ['#4285F4', '#EA4335', '#FBBC04', '#34A853']
-            ax3.pie(device_sessions.values(), labels=device_sessions.keys(), autopct='%1.1f%%',
-                   startangle=90, colors=colors_pie[:len(device_sessions)])
-            ax3.set_title('Traffic by Device Type', fontsize=14, fontweight='bold', pad=20)
+            fig3 = go.Figure(data=[
+                go.Pie(
+                    labels=list(device_sessions.keys()),
+                    values=list(device_sessions.values()),
+                    marker=dict(colors=['#4285F4', '#EA4335', '#FBBC04', '#34A853'])
+                )
+            ])
+            fig3.update_layout(
+                title='Traffic by Device Type',
+                height=400,
+                margin=dict(l=50, r=50, t=80, b=50)
+            )
             
             # Convert to base64
-            buffer3 = BytesIO()
-            plt.savefig(buffer3, format='png', dpi=150, bbox_inches='tight')
-            buffer3.seek(0)
-            charts['device_chart'] = base64.b64encode(buffer3.read()).decode()
-            plt.close()
+            img_bytes3 = pio.to_image(fig3, format='png', width=600, height=400)
+            charts['device_chart'] = base64.b64encode(img_bytes3).decode()
         
         return charts
         
