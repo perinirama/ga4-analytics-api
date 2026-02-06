@@ -11,6 +11,11 @@ import json
 from datetime import datetime, timedelta
 import anthropic
 import os
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for server
+import matplotlib.pyplot as plt
+import base64
+from io import BytesIO
 
 app = Flask(__name__)
 
@@ -266,6 +271,87 @@ Format your response as a clear, professional email report suitable for a market
     except Exception as e:
         return f"Error analyzing with Claude: {str(e)}"
 
+def generate_charts(ga4_data):
+    """
+    Generate charts from GA4 data and return as base64 encoded images
+    
+    Args:
+        ga4_data: Dictionary containing GA4 analytics data
+        
+    Returns:
+        Dictionary with base64 encoded chart images
+    """
+    charts = {}
+    
+    try:
+        # Extract data
+        pages = [page['pagePath'] for page in ga4_data['data'][:5]]  # Top 5 pages
+        sessions = [page['sessions'] for page in ga4_data['data'][:5]]
+        bounce_rates = [page['bounceRate'] * 100 for page in ga4_data['data'][:5]]
+        
+        # Truncate long page paths for better display
+        pages = [p[:30] + '...' if len(p) > 30 else p for p in pages]
+        
+        # Chart 1: Sessions by Page (Bar Chart)
+        fig1, ax1 = plt.subplots(figsize=(10, 6))
+        ax1.barh(pages, sessions, color='#4285F4')
+        ax1.set_xlabel('Sessions', fontsize=12, fontweight='bold')
+        ax1.set_title('Sessions by Page', fontsize=14, fontweight='bold', pad=20)
+        ax1.invert_yaxis()
+        plt.tight_layout()
+        
+        # Convert to base64
+        buffer1 = BytesIO()
+        plt.savefig(buffer1, format='png', dpi=150, bbox_inches='tight')
+        buffer1.seek(0)
+        charts['sessions_chart'] = base64.b64encode(buffer1.read()).decode()
+        plt.close()
+        
+        # Chart 2: Bounce Rate by Page (Horizontal Bar Chart)
+        fig2, ax2 = plt.subplots(figsize=(10, 6))
+        colors = ['#EA4335' if br > 60 else '#FBBC04' if br > 40 else '#34A853' for br in bounce_rates]
+        ax2.barh(pages, bounce_rates, color=colors)
+        ax2.set_xlabel('Bounce Rate (%)', fontsize=12, fontweight='bold')
+        ax2.set_title('Bounce Rate by Page', fontsize=14, fontweight='bold', pad=20)
+        ax2.invert_yaxis()
+        ax2.axvline(x=50, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+        plt.tight_layout()
+        
+        # Convert to base64
+        buffer2 = BytesIO()
+        plt.savefig(buffer2, format='png', dpi=150, bbox_inches='tight')
+        buffer2.seek(0)
+        charts['bounce_rate_chart'] = base64.b64encode(buffer2.read()).decode()
+        plt.close()
+        
+        # Chart 3: Device Breakdown (Pie Chart)
+        device_sessions = {}
+        for page in ga4_data['data']:
+            for device in page['devices']:
+                device_name = device['device']
+                device_sessions[device_name] = device_sessions.get(device_name, 0) + device['sessions']
+        
+        if device_sessions:
+            fig3, ax3 = plt.subplots(figsize=(8, 8))
+            colors_pie = ['#4285F4', '#EA4335', '#FBBC04', '#34A853']
+            ax3.pie(device_sessions.values(), labels=device_sessions.keys(), autopct='%1.1f%%',
+                   startangle=90, colors=colors_pie[:len(device_sessions)])
+            ax3.set_title('Traffic by Device Type', fontsize=14, fontweight='bold', pad=20)
+            
+            # Convert to base64
+            buffer3 = BytesIO()
+            plt.savefig(buffer3, format='png', dpi=150, bbox_inches='tight')
+            buffer3.seek(0)
+            charts['device_chart'] = base64.b64encode(buffer3.read()).decode()
+            plt.close()
+        
+        return charts
+        
+    except Exception as e:
+        print(f"Error generating charts: {str(e)}")
+        return {}
+
+
 @app.route('/analyze-with-ai', methods=['POST'])
 def analyze_with_ai():
     """
@@ -424,6 +510,9 @@ def analyze_with_ai():
         # Get Claude analysis
         ai_insights = analyze_with_claude(ga4_data, claude_api_key, urls, context)
         
+        # Generate charts
+        charts = generate_charts(ga4_data)
+        
         # Return combined response
         return jsonify({
             "success": True,
@@ -431,7 +520,8 @@ def analyze_with_ai():
             "date_range": ga4_data["date_range"],
             "total_pages": len(aggregated),
             "ga4_data": list(aggregated.values()),
-            "ai_insights": ai_insights
+            "ai_insights": ai_insights,
+            "charts": charts
         })
     
     except Exception as e:
