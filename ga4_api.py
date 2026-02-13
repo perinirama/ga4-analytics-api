@@ -968,6 +968,17 @@ def analyze_with_ai():
         # Get AI analysis
         ai_insights = analyze_with_claude(all_data, periods, claude_api_key, urls, context)
 
+        # Sanitise AI insights for JSON safety — remove control characters
+        # that break JSON parsing in Make.com
+        if isinstance(ai_insights, str):
+            import re
+            # Replace newlines and tabs with safe equivalents
+            ai_insights = ai_insights.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+            # Remove any remaining control characters (ASCII 0-31 except space)
+            ai_insights = re.sub(r'[\x00-\x1f\x7f]', '', ai_insights)
+            # Collapse multiple spaces into one
+            ai_insights = re.sub(r' {2,}', ' ', ai_insights)
+
         # Generate charts
         charts = generate_charts(all_data)
 
