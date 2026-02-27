@@ -10,6 +10,7 @@ from google.analytics.data_v1beta.types import (
 )
 from google.oauth2 import service_account
 import json
+import re
 from datetime import datetime, timedelta
 import anthropic
 import os
@@ -100,12 +101,11 @@ def analyze_ga4():
             })
 
         if urls:
-            url_paths = [urlparse(u).path or '/' for u in urls if u]
+            url_paths = [urlparse(u).path.rstrip('/') or '/' for u in urls if u]
             if url_paths:
-                filtered = [r for r in results if any(
-                    r['pagePath'] == p or r['pagePath'].startswith(p) for p in url_paths
-                )]
-                results = filtered if filtered else results
+                filtered = [r for r in results if r['pagePath'].rstrip('/') in url_paths]
+                if filtered:
+                    results = filtered
 
         aggregated = aggregate_basic(results)
 
@@ -187,7 +187,6 @@ def run_ga4_report(client, property_id, dimensions, metrics, start_date, end_dat
             entry[d] = row.dimension_values[i].value
         for i, m in enumerate(metrics):
             val = row.metric_values[i].value
-            # Try to parse as int first, then float
             try:
                 entry[m] = int(val)
             except ValueError:
@@ -199,9 +198,28 @@ def run_ga4_report(client, property_id, dimensions, metrics, start_date, end_dat
     return rows
 
 
+def sanitise_url_list(raw_urls):
+    """
+    Sanitise and normalise a list of URLs.
+    Handles strings with newline/comma separators, strips control characters,
+    and normalises paths for exact matching.
+    """
+    if isinstance(raw_urls, str):
+        # Split on newlines, carriage returns, or commas
+        raw_urls = re.split(r'[\n\r,]+', raw_urls)
+
+    cleaned = []
+    for u in raw_urls:
+        u = re.sub(r'[\x00-\x1f\x7f]', '', u).strip()
+        if u:
+            cleaned.append(u)
+    return cleaned
+
+
 def get_page_performance(client, property_id, start_date, end_date, urls=None):
     """
     Detailed page performance with device and traffic source breakdown.
+    Filters by exact URL path match only (no startswith).
     """
     dimensions = [
         "pagePath", "deviceCategory", "sessionSource",
@@ -217,14 +235,19 @@ def get_page_performance(client, property_id, start_date, end_date, urls=None):
 
     rows = run_ga4_report(client, property_id, dimensions, metrics, start_date, end_date)
 
-    # Filter by URL paths if provided
+    # FIX: Use exact path matching only (no startswith)
+    # This prevents / from matching every page on the site
     if urls:
-        url_paths = [urlparse(u).path or '/' for u in urls if u]
+        url_paths = set()
+        for u in urls:
+            path = urlparse(u).path.rstrip('/') or '/'
+            url_paths.add(path)
         if url_paths:
-            filtered = [r for r in rows if any(
-                r['pagePath'] == p or r['pagePath'].startswith(p) for p in url_paths
-            )]
-            rows = filtered if filtered else rows
+            filtered = [r for r in rows if r['pagePath'].rstrip('/') in url_paths]
+            if filtered:
+                rows = filtered
+            # If nothing matched (e.g. path not in data), return empty
+            # rather than falling back to all pages
 
     # Aggregate by page
     pages = {}
@@ -254,15 +277,12 @@ def get_page_performance(client, property_id, start_date, end_date, urls=None):
         p["_weighted_pages_per_session"] += row['screenPageViewsPerSession'] * s
         p["_weighted_engagement_rate"] += row['engagementRate'] * s
 
-        # Device breakdown
         dev = row['deviceCategory']
         p["devices"][dev] = p["devices"].get(dev, 0) + s
 
-        # Source breakdown
         src = f"{row['sessionSource']} / {row['sessionMedium']}"
         p["sources"][src] = p["sources"].get(src, 0) + s
 
-        # Channel breakdown
         ch = row['sessionDefaultChannelGroup']
         p["channels"][ch] = p["channels"].get(ch, 0) + s
 
@@ -276,7 +296,6 @@ def get_page_performance(client, property_id, start_date, end_date, urls=None):
             p["engagementRate"] = round(p["_weighted_engagement_rate"] / t, 4)
             p["avgEngagementDuration"] = round(p["userEngagementDuration"] / t, 2)
             p["returningUsers"] = p["totalUsers"] - p["newUsers"]
-        # Clean up internal fields
         for key in list(p.keys()):
             if key.startswith("_"):
                 del p[key]
@@ -293,7 +312,6 @@ def get_event_data(client, property_id, start_date, end_date):
         start_date=start_date, end_date=end_date,
         limit=50
     )
-    # Filter out default GA4 events that aren't useful
     noise_events = {'session_start', 'first_visit', 'page_view', 'user_engagement', 'scroll'}
     return [r for r in rows if r['eventName'] not in noise_events]
 
@@ -417,7 +435,6 @@ def collect_all_data(client, property_id, urls=None):
         current_totals = get_site_totals(client, property_id, cs, ce)
         previous_totals = get_site_totals(client, property_id, ps, pe)
 
-        # Calculate changes
         changes = {}
         for metric in current_totals:
             curr_val = current_totals.get(metric, 0)
@@ -442,7 +459,6 @@ def collect_all_data(client, property_id, urls=None):
             "totals": changes
         }
 
-    # Detailed data for the primary period (last 7 days)
     cs7 = periods["last_7_days"]["current_start"]
     ce7 = periods["last_7_days"]["current_end"]
     ps7 = periods["last_7_days"]["previous_start"]
@@ -459,7 +475,6 @@ def collect_all_data(client, property_id, urls=None):
     all_data["time_of_day"] = get_time_of_day(client, property_id, cs7, ce7)
     all_data["acquisition"] = get_user_acquisition(client, property_id, cs7, ce7)
 
-    # Also get 30-day page performance for comparison
     cs30 = periods["last_30_days"]["current_start"]
     ce30 = periods["last_30_days"]["current_end"]
     all_data["page_performance_30d"] = get_page_performance(client, property_id, cs30, ce30, urls)
@@ -477,7 +492,6 @@ def build_data_summary(all_data, periods):
     """
     lines = []
 
-    # --- Site-level trends across all periods ---
     lines.append("=" * 60)
     lines.append("SITE-LEVEL TRENDS ACROSS PERIODS")
     lines.append("=" * 60)
@@ -495,7 +509,6 @@ def build_data_summary(all_data, periods):
             pct = vals['change_pct']
             pct_str = f"{pct:+.1f}%" if pct is not None else "N/A"
 
-            # Format rates as percentages
             if metric in ('bounceRate', 'engagementRate'):
                 lines.append(f"  {metric}: {curr:.1%} (was {prev:.1%}, change: {pct_str})")
             elif metric == 'averageSessionDuration':
@@ -503,7 +516,6 @@ def build_data_summary(all_data, periods):
             else:
                 lines.append(f"  {metric}: {curr:,} (was {prev:,}, change: {pct_str})")
 
-    # --- Page performance (current 7 days) ---
     lines.append("\n" + "=" * 60)
     lines.append("PAGE PERFORMANCE — LAST 7 DAYS")
     lines.append("=" * 60)
@@ -512,10 +524,9 @@ def build_data_summary(all_data, periods):
     previous_pages = all_data.get("page_performance", {}).get("previous", [])
     prev_lookup = {p['pagePath']: p for p in previous_pages}
 
-    # Sort by sessions descending
     current_pages_sorted = sorted(current_pages, key=lambda x: x['sessions'], reverse=True)
 
-    for page in current_pages_sorted[:15]:  # Top 15 pages
+    for page in current_pages_sorted[:15]:
         path = page['pagePath']
         lines.append(f"\n  Page: {path}")
         lines.append(f"    Sessions: {page['sessions']:,}")
@@ -527,25 +538,21 @@ def build_data_summary(all_data, periods):
         lines.append(f"    Pages per session: {page.get('pagesPerSession', 0):.1f}")
         lines.append(f"    Events fired: {page['eventCount']:,}")
 
-        # Device split
         devices = page.get('devices', {})
         if devices:
             dev_str = ", ".join(f"{k}: {v}" for k, v in sorted(devices.items(), key=lambda x: -x[1]))
             lines.append(f"    Devices: {dev_str}")
 
-        # Top channels
         channels = page.get('channels', {})
         if channels:
             ch_str = ", ".join(f"{k}: {v}" for k, v in sorted(channels.items(), key=lambda x: -x[1])[:5])
             lines.append(f"    Top channels: {ch_str}")
 
-        # Top sources
         sources = page.get('sources', {})
         if sources:
             src_str = ", ".join(f"{k}: {v}" for k, v in sorted(sources.items(), key=lambda x: -x[1])[:5])
             lines.append(f"    Top sources: {src_str}")
 
-        # Week-over-week comparison
         prev = prev_lookup.get(path)
         if prev:
             s_change = page['sessions'] - prev['sessions']
@@ -553,7 +560,6 @@ def build_data_summary(all_data, periods):
             lines.append(f"    vs previous 7 days: sessions {s_change:+,} ({s_pct:+.1f}%), "
                          f"bounce {page['bounceRate'] - prev['bounceRate']:+.1%}")
 
-    # --- 30-day page performance ---
     lines.append("\n" + "=" * 60)
     lines.append("PAGE PERFORMANCE — LAST 30 DAYS")
     lines.append("=" * 60)
@@ -568,7 +574,6 @@ def build_data_summary(all_data, periods):
         lines.append(f"    Bounce: {page['bounceRate']:.1%} | Engagement: {page['engagementRate']:.1%}")
         lines.append(f"    Avg duration: {page['averageSessionDuration']:.1f}s")
 
-    # --- Events ---
     lines.append("\n" + "=" * 60)
     lines.append("USER EVENTS (excluding default GA4 events)")
     lines.append("=" * 60)
@@ -578,13 +583,11 @@ def build_data_summary(all_data, periods):
     for ev in events_sorted[:15]:
         lines.append(f"  {ev['eventName']}: {ev['eventCount']:,} events by {ev['totalUsers']:,} users")
 
-    # --- Landing pages ---
     lines.append("\n" + "=" * 60)
     lines.append("LANDING PAGES (entry points)")
     lines.append("=" * 60)
 
     landings = all_data.get("landing_pages", [])
-    # Aggregate by landing page
     lp_agg = {}
     for lp in landings:
         path = lp['landingPage']
@@ -598,13 +601,11 @@ def build_data_summary(all_data, periods):
         ch_str = ", ".join(f"{k}: {v}" for k, v in sorted(info['channels'].items(), key=lambda x: -x[1])[:3])
         lines.append(f"  {path}: {info['sessions']:,} sessions (channels: {ch_str})")
 
-    # --- Geographic ---
     lines.append("\n" + "=" * 60)
     lines.append("GEOGRAPHIC BREAKDOWN")
     lines.append("=" * 60)
 
     geo = all_data.get("geographic", [])
-    # Aggregate by country
     country_agg = {}
     for g in geo:
         c = g['country']
@@ -612,19 +613,16 @@ def build_data_summary(all_data, periods):
     for country, sess in sorted(country_agg.items(), key=lambda x: -x[1])[:10]:
         lines.append(f"  {country}: {sess:,} sessions")
 
-    # Top cities
     geo_sorted = sorted(geo, key=lambda x: x['sessions'], reverse=True)
     lines.append("  Top cities:")
     for g in geo_sorted[:10]:
         lines.append(f"    {g['city']}, {g['country']}: {g['sessions']:,} sessions (engagement: {g['engagementRate']:.1%})")
 
-    # --- Time of day ---
     lines.append("\n" + "=" * 60)
     lines.append("TRAFFIC PATTERNS BY TIME")
     lines.append("=" * 60)
 
     tod = all_data.get("time_of_day", [])
-    # Aggregate by hour
     hour_agg = {}
     for t in tod:
         h = int(t['hour'])
@@ -635,7 +633,6 @@ def build_data_summary(all_data, periods):
         lines.append(f"  Peak hour: {peak_hour}:00 ({hour_agg[peak_hour]:,} sessions)")
         lines.append(f"  Quietest hour: {quiet_hour}:00 ({hour_agg[quiet_hour]:,} sessions)")
 
-    # Aggregate by day of week
     day_names = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
     day_agg = {}
     for t in tod:
@@ -648,13 +645,11 @@ def build_data_summary(all_data, periods):
             if d in day_agg:
                 lines.append(f"    {day_names[d]}: {day_agg[d]:,}")
 
-    # --- Acquisition ---
     lines.append("\n" + "=" * 60)
     lines.append("ACQUISITION CHANNELS")
     lines.append("=" * 60)
 
     acq = all_data.get("acquisition", [])
-    # Aggregate by channel
     ch_agg = {}
     for a in acq:
         ch = a['sessionDefaultChannelGroup']
@@ -684,7 +679,6 @@ def analyze_with_claude(all_data, periods, claude_api_key, urls=None, context=No
 
         data_summary = build_data_summary(all_data, periods)
 
-        # Build the prompt
         system_prompt = """You are a senior digital analytics consultant who produces clear, data-driven website performance reports. Your reports are valued because every insight is tied to a specific number from the data, and every recommendation explains exactly what to do and why it will work.
 
 You write in British English. You never use filler phrases like "it's worth noting" or "interestingly". You are direct and specific.
@@ -794,7 +788,6 @@ def generate_charts(all_data):
     charts = {}
 
     try:
-        # --- Chart 1: Sessions by page (top pages, last 7 days) ---
         current_pages = all_data.get("page_performance", {}).get("current", [])
         pages_sorted = sorted(current_pages, key=lambda x: x['sessions'], reverse=True)[:8]
 
@@ -818,7 +811,6 @@ def generate_charts(all_data):
             img = pio.to_image(fig1, format='png', width=800, height=max(300, len(pages_sorted) * 50 + 100))
             charts['sessions_chart'] = base64.b64encode(img).decode()
 
-        # --- Chart 2: Bounce rate by page ---
         if pages_sorted:
             bounce_rates = [p['bounceRate'] * 100 for p in pages_sorted]
             colors = ['#EA4335' if br > 60 else '#FBBC04' if br > 40 else '#34A853' for br in bounce_rates]
@@ -840,7 +832,6 @@ def generate_charts(all_data):
             img = pio.to_image(fig2, format='png', width=800, height=max(300, len(pages_sorted) * 50 + 100))
             charts['bounce_rate_chart'] = base64.b64encode(img).decode()
 
-        # --- Chart 3: Device breakdown (pie) ---
         device_totals = {}
         for page in current_pages:
             for dev, sess in page.get('devices', {}).items():
@@ -865,7 +856,6 @@ def generate_charts(all_data):
             img = pio.to_image(fig3, format='png', width=600, height=400)
             charts['device_chart'] = base64.b64encode(img).decode()
 
-        # --- Chart 4: Acquisition channels ---
         acq = all_data.get("acquisition", [])
         ch_agg = {}
         for a in acq:
@@ -892,7 +882,6 @@ def generate_charts(all_data):
             img = pio.to_image(fig4, format='png', width=800, height=400)
             charts['acquisition_chart'] = base64.b64encode(img).decode()
 
-        # --- Chart 5: Engagement rate by page ---
         if pages_sorted:
             eng_rates = [p['engagementRate'] * 100 for p in pages_sorted]
             eng_colors = ['#34A853' if er > 60 else '#FBBC04' if er > 40 else '#EA4335' for er in eng_rates]
@@ -932,8 +921,8 @@ def analyze_with_ai():
     {
         "property_id": "123456789",
         "credentials": { GA4 service account JSON },
-        "urls": ["https://example.com/page1"],
-        "days_back": 7,            // kept for compatibility but multi-period is automatic
+        "urls": ["https://example.com/page1"],   // single URL, list, or newline-separated string
+        "days_back": 7,
         "claude_api_key": "sk-ant-...",
         "context": "Optional business context about this client"
     }
@@ -949,8 +938,12 @@ def analyze_with_ai():
 
         property_id = data.get('property_id')
         credentials_dict = data.get('credentials')
-        urls = data.get('urls', [])
         context = data.get('context', '')
+
+        # FIX: Sanitise and normalise incoming URLs
+        # Handles newline-separated strings from Tally, lists, and control characters
+        raw_urls = data.get('urls', [])
+        urls = sanitise_url_list(raw_urls)
 
         if not property_id or not credentials_dict:
             return jsonify({"error": "property_id and credentials are required"}), 400
@@ -968,21 +961,15 @@ def analyze_with_ai():
         # Get AI analysis
         ai_insights = analyze_with_claude(all_data, periods, claude_api_key, urls, context)
 
-        # Sanitise AI insights for JSON safety — remove control characters
-        # that break JSON parsing in Make.com
+        # Sanitise AI insights for JSON safety
         if isinstance(ai_insights, str):
-            import re
-            # Replace newlines and tabs with safe equivalents
             ai_insights = ai_insights.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
-            # Remove any remaining control characters (ASCII 0-31 except space)
             ai_insights = re.sub(r'[\x00-\x1f\x7f]', '', ai_insights)
-            # Collapse multiple spaces into one
             ai_insights = re.sub(r' {2,}', ' ', ai_insights)
 
         # Generate charts
         charts = generate_charts(all_data)
 
-        # Build response
         now = datetime.now()
         return jsonify({
             "success": True,
