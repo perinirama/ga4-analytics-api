@@ -928,9 +928,13 @@ def analyze_with_ai():
     }
     """
     try:
+        # Read raw body and strip control characters before JSON parsing
+        # This handles newlines inside Tally URL fields and credentials
+        # that would otherwise cause "bad control character" errors in Make
         raw_body = request.get_data(as_text=True)
         raw_body = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', raw_body)
-        data = json.loads(raw_body)
+        data = json.loads(raw_body) if raw_body else None
+
         if not data:
             return jsonify({"error": "No JSON payload provided"}), 400
 
