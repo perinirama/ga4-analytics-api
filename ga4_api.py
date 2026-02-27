@@ -928,7 +928,9 @@ def analyze_with_ai():
     }
     """
     try:
-        data = request.get_json()
+        raw_body = request.get_data(as_text=True)
+        raw_body = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', raw_body)
+        data = json.loads(raw_body)
         if not data:
             return jsonify({"error": "No JSON payload provided"}), 400
 
