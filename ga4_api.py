@@ -394,33 +394,33 @@ def get_site_totals(client, property_id, start_date, end_date):
 def collect_all_data(client, property_id, urls=None):
     """
     Collect GA4 data across three comparison periods:
-    - Last 7 days vs previous 7 days
-    - Last 30 days vs previous 30 days
-    - Last 7 days vs same 7 days last year
+    - Last 28 days vs previous 28 days
+    - Last 28 days vs same 28 days last year (YoY)
+    - Last 90 days vs previous 90 days
     """
     now = datetime.now()
 
     periods = {
-        "last_7_days": {
-            "current_start": now - timedelta(days=7),
+        "last_28_days": {
+            "current_start": now - timedelta(days=28),
             "current_end": now,
-            "previous_start": now - timedelta(days=14),
-            "previous_end": now - timedelta(days=7),
-            "label": "Last 7 days"
-        },
-        "last_30_days": {
-            "current_start": now - timedelta(days=30),
-            "current_end": now,
-            "previous_start": now - timedelta(days=60),
-            "previous_end": now - timedelta(days=30),
-            "label": "Last 30 days"
+            "previous_start": now - timedelta(days=56),
+            "previous_end": now - timedelta(days=28),
+            "label": "Last 28 days"
         },
         "year_over_year": {
-            "current_start": now - timedelta(days=7),
+            "current_start": now - timedelta(days=28),
             "current_end": now,
-            "previous_start": now - timedelta(days=365 + 7),
+            "previous_start": now - timedelta(days=365 + 28),
             "previous_end": now - timedelta(days=365),
-            "label": "Last 7 days vs same period last year"
+            "label": "Last 28 days vs same period last year"
+        },
+        "last_90_days": {
+            "current_start": now - timedelta(days=90),
+            "current_end": now,
+            "previous_start": now - timedelta(days=180),
+            "previous_end": now - timedelta(days=90),
+            "label": "Last 90 days"
         }
     }
 
@@ -459,25 +459,27 @@ def collect_all_data(client, property_id, urls=None):
             "totals": changes
         }
 
-    cs7 = periods["last_7_days"]["current_start"]
-    ce7 = periods["last_7_days"]["current_end"]
-    ps7 = periods["last_7_days"]["previous_start"]
-    pe7 = periods["last_7_days"]["previous_end"]
+    # Detailed data for primary period (last 28 days)
+    cs28 = periods["last_28_days"]["current_start"]
+    ce28 = periods["last_28_days"]["current_end"]
+    ps28 = periods["last_28_days"]["previous_start"]
+    pe28 = periods["last_28_days"]["previous_end"]
 
     all_data["page_performance"] = {
-        "current": get_page_performance(client, property_id, cs7, ce7, urls),
-        "previous": get_page_performance(client, property_id, ps7, pe7, urls)
+        "current": get_page_performance(client, property_id, cs28, ce28, urls),
+        "previous": get_page_performance(client, property_id, ps28, pe28, urls)
     }
-    all_data["events"] = get_event_data(client, property_id, cs7, ce7)
-    all_data["landing_pages"] = get_landing_pages(client, property_id, cs7, ce7)
-    all_data["exit_pages"] = get_exit_pages(client, property_id, cs7, ce7)
-    all_data["geographic"] = get_geographic_data(client, property_id, cs7, ce7)
-    all_data["time_of_day"] = get_time_of_day(client, property_id, cs7, ce7)
-    all_data["acquisition"] = get_user_acquisition(client, property_id, cs7, ce7)
+    all_data["events"] = get_event_data(client, property_id, cs28, ce28)
+    all_data["landing_pages"] = get_landing_pages(client, property_id, cs28, ce28)
+    all_data["exit_pages"] = get_exit_pages(client, property_id, cs28, ce28)
+    all_data["geographic"] = get_geographic_data(client, property_id, cs28, ce28)
+    all_data["time_of_day"] = get_time_of_day(client, property_id, cs28, ce28)
+    all_data["acquisition"] = get_user_acquisition(client, property_id, cs28, ce28)
 
-    cs30 = periods["last_30_days"]["current_start"]
-    ce30 = periods["last_30_days"]["current_end"]
-    all_data["page_performance_30d"] = get_page_performance(client, property_id, cs30, ce30, urls)
+    # YoY page performance for comparison
+    cs_yoy = periods["year_over_year"]["previous_start"]
+    ce_yoy = periods["year_over_year"]["previous_end"]
+    all_data["page_performance_yoy"] = get_page_performance(client, property_id, cs_yoy, ce_yoy, urls)
 
     return all_data, periods
 
@@ -486,7 +488,7 @@ def collect_all_data(client, property_id, urls=None):
 # AI ANALYSIS WITH CLAUDE
 # ============================================================
 
-def build_data_summary(all_data, periods):
+def build_data_summary(all_data, periods, urls=None):
     """
     Build a structured text summary of all GA4 data for the AI prompt.
     """
@@ -496,7 +498,7 @@ def build_data_summary(all_data, periods):
     lines.append("SITE-LEVEL TRENDS ACROSS PERIODS")
     lines.append("=" * 60)
 
-    for period_key in ["last_7_days", "last_30_days", "year_over_year"]:
+    for period_key in ["last_28_days", "year_over_year", "last_90_days"]:
         pd = all_data[period_key]
         lines.append(f"\n--- {pd['label']} ---")
         lines.append(f"Current period: {pd['date_range']['current']}")
@@ -526,7 +528,9 @@ def build_data_summary(all_data, periods):
 
     current_pages_sorted = sorted(current_pages, key=lambda x: x['sessions'], reverse=True)
 
-    for page in current_pages_sorted[:15]:
+    # Show all pages when specific URLs were requested, otherwise cap at 30
+    page_limit = len(current_pages_sorted) if urls else 30
+    for page in current_pages_sorted[:page_limit]:
         path = page['pagePath']
         lines.append(f"\n  Page: {path}")
         lines.append(f"    Sessions: {page['sessions']:,}")
@@ -557,17 +561,18 @@ def build_data_summary(all_data, periods):
         if prev:
             s_change = page['sessions'] - prev['sessions']
             s_pct = ((s_change / prev['sessions']) * 100) if prev['sessions'] > 0 else 0
-            lines.append(f"    vs previous 7 days: sessions {s_change:+,} ({s_pct:+.1f}%), "
+            lines.append(f"    vs previous 28 days: sessions {s_change:+,} ({s_pct:+.1f}%), "
                          f"bounce {page['bounceRate'] - prev['bounceRate']:+.1%}")
 
     lines.append("\n" + "=" * 60)
-    lines.append("PAGE PERFORMANCE — LAST 30 DAYS")
+    lines.append("PAGE PERFORMANCE — SAME PERIOD LAST YEAR (YoY)")
     lines.append("=" * 60)
 
-    pages_30d = all_data.get("page_performance_30d", [])
-    pages_30d_sorted = sorted(pages_30d, key=lambda x: x['sessions'], reverse=True)
+    pages_yoy = all_data.get("page_performance_yoy", [])
+    pages_yoy_sorted = sorted(pages_yoy, key=lambda x: x['sessions'], reverse=True)
+    yoy_limit = len(pages_yoy_sorted) if urls else 30
 
-    for page in pages_30d_sorted[:10]:
+    for page in pages_yoy_sorted[:yoy_limit]:
         path = page['pagePath']
         lines.append(f"\n  Page: {path}")
         lines.append(f"    Sessions: {page['sessions']:,} | Users: {page['totalUsers']:,}")
@@ -677,7 +682,7 @@ def analyze_with_claude(all_data, periods, claude_api_key, urls=None, context=No
     try:
         client = anthropic.Anthropic(api_key=claude_api_key)
 
-        data_summary = build_data_summary(all_data, periods)
+        data_summary = build_data_summary(all_data, periods, urls)
 
         system_prompt = """You are a senior digital analytics consultant who produces clear, data-driven website performance reports. Your reports are valued because every insight is tied to a specific number from the data, and every recommendation explains exactly what to do and why it will work.
 
@@ -695,31 +700,48 @@ IMPORTANT FORMATTING RULES:
 - Do NOT use markdown formatting. Only HTML.
 - Do NOT include <html>, <head>, or <body> tags — just the content HTML."""
 
+        # Detect if this is a multi-location gym/venue report
+        is_location_report = urls and len(urls) > 3 and all('find-a-gym' in u or 'location' in u or 'club' in u for u in urls[:3])
+        location_context = """
+IMPORTANT: The URLs being analysed are individual gym/venue location pages. Each page represents a physical location.
+When analysing these pages:
+- Treat each page as representing a physical gym location, not just a web page
+- "Sessions" = people researching that specific gym location
+- High bounce rate on a location page may mean people found what they needed quickly (address, opening hours) — context matters
+- Compare locations against each other to identify which gyms are attracting the most online interest
+- Low traffic to a location page may indicate that gym needs more local SEO or marketing support
+- Session duration on location pages matters — longer = more consideration/research intent
+""" if is_location_report else ""
+
         user_prompt = f"""Analyse the following GA4 website analytics data and produce a comprehensive performance report.
 
 {f'BUSINESS CONTEXT: {context}' if context else 'No specific business context provided — analyse from a general digital performance perspective.'}
 
 {f'SPECIFIC URLs REQUESTED: {", ".join(urls)}' if urls else 'Analyse all pages in the data.'}
+{location_context}
+REPORTING PERIOD: Last 28 days compared to previous 28 days and same period last year.
 
 {data_summary}
 
 REPORT STRUCTURE — follow this exactly:
 
 1. EXECUTIVE SUMMARY
-   - 3-4 sentence overview of overall website health
+   - 3-4 sentence overview of overall performance
    - Include the single most important finding
-   - State whether things are improving or declining and by how much
+   - State whether things are improving or declining across the 28-day period and YoY
+   {"- If analysing location pages, identify the top and bottom performing locations by sessions" if is_location_report else ""}
 
 2. LEAD GENERATION & CONVERSION SIGNALS
    - Answer: "How are we tracking from a hot lead/joiner perspective?"
    - Look at conversion events, form submissions, contact events, booking events
    - Analyse engagement patterns that indicate purchase/enquiry intent (high engagement duration, multiple pages per session, specific event triggers)
    - If no explicit conversion events exist, identify proxy signals (engagement rate, session duration, pages per session, scroll events)
+   {"- For location pages: which gyms are generating the most high-intent visits (long session duration + high engagement)?" if is_location_report else ""}
    - For each finding, add a "Plain English" box explaining what it means for the business
 
 3. USER TRENDS & TRAFFIC HEALTH
-   - Answer: "How is the number of users trending across the site?"
-   - Compare 7-day, 30-day, and year-over-year trends
+   - Answer: "How is the number of users trending?"
+   - Compare 28-day vs previous 28 days AND year-over-year trends
    - Break down new vs returning users and what that ratio means
    - Identify which acquisition channels are growing or shrinking
    - For each finding, add a "Plain English" box
@@ -734,12 +756,12 @@ REPORT STRUCTURE — follow this exactly:
    - Geographic patterns — where are the most engaged users?
    - For each finding, add a "Plain English" box
 
-5. CONTENT PERFORMANCE
-   - Answer: "What content is being best received?"
-   - Compare pages against each other: which pages have the best engagement rate, lowest bounce rate, longest session duration?
-   - Which landing pages are most effective at keeping users?
-   - Which pages have the worst drop-off and why might that be?
-   - If multiple pages exist, create an HTML comparison table with columns: Page, Sessions, Bounce Rate, Engagement Rate, Avg Duration, Verdict
+5. PAGE/LOCATION PERFORMANCE
+   - Answer: "{"Which locations are performing best and worst?" if is_location_report else "What content is being best received?"}"
+   - Compare {"all gym location pages" if is_location_report else "pages"} against each other: which have the best engagement rate, lowest bounce rate, longest session duration?
+   - {"Rank all locations from best to worst performing and explain what might drive the differences (e.g. London locations vs regional)" if is_location_report else "Which landing pages are most effective at keeping users?"}
+   - Create an HTML comparison table with columns: {"Location" if is_location_report else "Page"}, Sessions, Bounce Rate, Engagement Rate, Avg Duration, 28d vs Previous, Verdict
+   - Include ALL pages/locations provided — do not truncate the table
    - For each finding, add a "Plain English" box
 
 6. ACTIONABLE RECOMMENDATIONS
@@ -749,17 +771,19 @@ REPORT STRUCTURE — follow this exactly:
    c) PLAN FOR NEXT QUARTER (strategic, requires resources)
 
    Each recommendation MUST:
-   - Reference a specific metric from the data (e.g. "bounce rate on /pricing is 72%, which is 25pp above site average")
-   - Explain exactly what to do (not "improve SEO" but "add a clear call-to-action above the fold on /services targeting the 340 weekly organic visitors who currently bounce at 65%")
+   - Reference a specific metric from the data
+   - Explain exactly what to do with specifics (not "improve SEO" but "add localised content to the /find-a-gym/bangor page which has only 45 sessions vs the London average of 2,400")
    - Estimate the potential impact where possible
+   {"- At least 2 recommendations should address specific underperforming locations" if is_location_report else ""}
 
 CRITICAL RULES:
 - Every claim must reference a specific number from the data. No vague statements.
-- If a metric looks anomalous (e.g. 8-second session duration with high engagement), flag it and explain possible causes.
-- When comparing pages, always state which page is better and by how much.
+- If a metric looks anomalous, flag it and explain possible causes.
+- When comparing pages/locations, always state which is better and by how much.
 - The "Plain English" boxes should be written as if explaining to a business owner who doesn't know analytics terminology. Use a <div> with style="background-color: #f0f7ff; border-left: 4px solid #4285F4; padding: 12px; margin: 10px 0; border-radius: 4px;" for these boxes.
 - Format all percentages to 1 decimal place. Format all numbers with commas for thousands.
-- If data seems insufficient or unusual, say so honestly rather than making up interpretations."""
+- If data seems insufficient or unusual, say so honestly rather than making up interpretations.
+- The comparison table in section 5 MUST include every single location/page — do not say "top X" or truncate."""
 
         message = client.messages.create(
             model="claude-sonnet-4-20250514",
@@ -801,7 +825,7 @@ def generate_charts(all_data):
                        text=sessions, textposition='outside')
             ])
             fig1.update_layout(
-                title='Sessions by page (last 7 days)',
+                title='Sessions by page (last 28 days)',
                 xaxis_title='Sessions',
                 yaxis=dict(autorange="reversed"),
                 height=max(300, len(pages_sorted) * 50 + 100),
@@ -984,7 +1008,7 @@ def analyze_with_ai():
             "success": True,
             "property_id": property_id,
             "date_range": {
-                "start": (now - timedelta(days=7)).strftime("%Y-%m-%d"),
+                "start": (now - timedelta(days=28)).strftime("%Y-%m-%d"),
                 "end": now.strftime("%Y-%m-%d")
             },
             "total_pages": len(all_data.get("page_performance", {}).get("current", [])),
