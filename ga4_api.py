@@ -944,6 +944,9 @@ def analyze_with_ai():
 
         property_id = data.get('property_id')
         credentials_dict = data.get('credentials')
+        # Handle credentials arriving as a string (from Make data structure mode)
+        if isinstance(credentials_dict, str):
+    credentials_dict = json.loads(credentials_dict)
         context = data.get('context', '')
 
         # FIX: Sanitise and normalise incoming URLs
