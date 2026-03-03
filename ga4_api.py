@@ -6,6 +6,7 @@ from google.analytics.data_v1beta.types import (
     Dimension,
     Metric,
     FilterExpression,
+    FilterExpressionList,
     Filter,
 )
 from google.oauth2 import service_account
@@ -28,12 +29,11 @@ app = Flask(__name__)
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
     return jsonify({"status": "healthy", "timestamp": datetime.utcnow().isoformat()})
 
 
 # ============================================================
-# LEGACY ENDPOINT (kept for backwards compatibility)
+# LEGACY ENDPOINT
 # ============================================================
 
 @app.route('/analyze', methods=['POST'])
@@ -64,15 +64,10 @@ def analyze_ga4():
 
         request_params = RunReportRequest(
             property=f"properties/{property_id}",
-            dimensions=[
-                Dimension(name="pagePath"),
-                Dimension(name="deviceCategory"),
-            ],
+            dimensions=[Dimension(name="pagePath"), Dimension(name="deviceCategory")],
             metrics=[
-                Metric(name="sessions"),
-                Metric(name="totalUsers"),
-                Metric(name="bounceRate"),
-                Metric(name="averageSessionDuration"),
+                Metric(name="sessions"), Metric(name="totalUsers"),
+                Metric(name="bounceRate"), Metric(name="averageSessionDuration"),
                 Metric(name="engagedSessions"),
             ],
             date_ranges=[DateRange(
@@ -83,7 +78,6 @@ def analyze_ga4():
         )
 
         response = client.run_report(request_params)
-
         results = []
         for row in response.rows:
             results.append({
@@ -104,7 +98,6 @@ def analyze_ga4():
                     results = filtered
 
         aggregated = aggregate_basic(results)
-
         return jsonify({
             "success": True,
             "property_id": property_id,
@@ -117,11 +110,7 @@ def analyze_ga4():
         })
 
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "error_type": type(e).__name__
-        }), 500
+        return jsonify({"success": False, "error": str(e), "error_type": type(e).__name__}), 500
 
 
 def aggregate_basic(results):
@@ -130,28 +119,22 @@ def aggregate_basic(results):
         path = row['pagePath']
         if path not in aggregated:
             aggregated[path] = {
-                "pagePath": path,
-                "sessions": 0, "totalUsers": 0,
+                "pagePath": path, "sessions": 0, "totalUsers": 0,
                 "bounceRate": 0, "averageSessionDuration": 0,
                 "engagedSessions": 0, "devices": []
             }
         aggregated[path]["sessions"] += row["sessions"]
         aggregated[path]["totalUsers"] += row["totalUsers"]
         aggregated[path]["engagedSessions"] += row["engagedSessions"]
-        aggregated[path]["devices"].append({
-            "device": row["deviceCategory"],
-            "sessions": row["sessions"]
-        })
+        aggregated[path]["devices"].append({"device": row["deviceCategory"], "sessions": row["sessions"]})
 
     for path, data in aggregated.items():
         total = data["sessions"]
         if total > 0:
             data["bounceRate"] = round(
-                sum(r["bounceRate"] * r["sessions"] for r in results if r["pagePath"] == path) / total, 4
-            )
+                sum(r["bounceRate"] * r["sessions"] for r in results if r["pagePath"] == path) / total, 4)
             data["averageSessionDuration"] = round(
-                sum(r["averageSessionDuration"] * r["sessions"] for r in results if r["pagePath"] == path) / total, 2
-            )
+                sum(r["averageSessionDuration"] * r["sessions"] for r in results if r["pagePath"] == path) / total, 2)
     return aggregated
 
 
@@ -159,8 +142,51 @@ def aggregate_basic(results):
 # GA4 DATA COLLECTION FUNCTIONS
 # ============================================================
 
-def run_ga4_report(client, property_id, dimensions, metrics, start_date, end_date, limit=5000):
-    request_params = RunReportRequest(
+def build_url_filter(url_paths):
+    """
+    Build a GA4 dimension filter that matches any of the given URL paths exactly.
+    Uses IN_LIST filter when multiple paths, EXACT when single.
+    """
+    # Normalise: strip trailing slashes, ensure leading slash
+    paths = list({p.rstrip('/') or '/' for p in url_paths})
+
+    if len(paths) == 1:
+        return FilterExpression(
+            filter=Filter(
+                field_name="pagePath",
+                string_filter=Filter.StringFilter(
+                    match_type=Filter.StringFilter.MatchType.EXACT,
+                    value=paths[0],
+                    case_sensitive=False
+                )
+            )
+        )
+    else:
+        return FilterExpression(
+            or_group=FilterExpressionList(
+                expressions=[
+                    FilterExpression(
+                        filter=Filter(
+                            field_name="pagePath",
+                            string_filter=Filter.StringFilter(
+                                match_type=Filter.StringFilter.MatchType.EXACT,
+                                value=p,
+                                case_sensitive=False
+                            )
+                        )
+                    )
+                    for p in paths
+                ]
+            )
+        )
+
+
+def run_ga4_report(client, property_id, dimensions, metrics, start_date, end_date, limit=10000, url_filter=None):
+    """
+    Generic GA4 report runner. Returns list of dicts.
+    Optionally applies a dimension filter at the API level.
+    """
+    kwargs = dict(
         property=f"properties/{property_id}",
         dimensions=[Dimension(name=d) for d in dimensions],
         metrics=[Metric(name=m) for m in metrics],
@@ -170,6 +196,10 @@ def run_ga4_report(client, property_id, dimensions, metrics, start_date, end_dat
         )],
         limit=limit
     )
+    if url_filter is not None:
+        kwargs['dimension_filter'] = url_filter
+
+    request_params = RunReportRequest(**kwargs)
     response = client.run_report(request_params)
 
     rows = []
@@ -193,7 +223,6 @@ def run_ga4_report(client, property_id, dimensions, metrics, start_date, end_dat
 def sanitise_url_list(raw_urls):
     if isinstance(raw_urls, str):
         raw_urls = re.split(r'[\n\r,]+', raw_urls)
-
     cleaned = []
     for u in raw_urls:
         u = re.sub(r'[\x00-\x1f\x7f]', '', u).strip()
@@ -203,6 +232,11 @@ def sanitise_url_list(raw_urls):
 
 
 def get_page_performance(client, property_id, start_date, end_date, urls=None):
+    """
+    Detailed page performance filtered at the GA4 API level using dimension filters.
+    This avoids the row-limit issue where fetching all pages and filtering afterwards
+    would miss rows when the site has >10k page/device/source combinations.
+    """
     print(f"[DEBUG] get_page_performance | {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} | urls={urls}", flush=True)
 
     dimensions = [
@@ -217,18 +251,25 @@ def get_page_performance(client, property_id, start_date, end_date, urls=None):
         "eventCount"
     ]
 
-    rows = run_ga4_report(client, property_id, dimensions, metrics, start_date, end_date)
-
+    # Build API-level filter if URLs are specified
+    url_filter = None
+    url_paths = set()
     if urls:
-        url_paths = set()
         for u in urls:
             path = urlparse(u).path.rstrip('/') or '/'
             url_paths.add(path)
-        print(f"[DEBUG] filtering rows to url_paths={url_paths} | total rows before filter={len(rows)}", flush=True)
-        if url_paths:
-            rows = [r for r in rows if r['pagePath'].rstrip('/') in url_paths]
-        print(f"[DEBUG] rows after filter={len(rows)}", flush=True)
+        url_filter = build_url_filter(url_paths)
+        print(f"[DEBUG] applying GA4 dimension filter for paths={url_paths}", flush=True)
 
+    rows = run_ga4_report(
+        client, property_id, dimensions, metrics,
+        start_date, end_date,
+        limit=10000,
+        url_filter=url_filter
+    )
+    print(f"[DEBUG] GA4 returned {len(rows)} rows", flush=True)
+
+    # Aggregate by page
     pages = {}
     for row in rows:
         path = row['pagePath']
@@ -284,22 +325,26 @@ def get_page_performance(client, property_id, start_date, end_date, urls=None):
 
 
 def get_event_data(client, property_id, start_date, end_date, urls=None):
+    url_filter = None
+    if urls:
+        url_paths = set()
+        for u in urls:
+            path = urlparse(u).path.rstrip('/') or '/'
+            url_paths.add(path)
+        url_filter = build_url_filter(url_paths)
+
     dimensions = ["eventName", "pagePath"] if urls else ["eventName"]
     rows = run_ga4_report(
         client, property_id,
         dimensions=dimensions,
         metrics=["eventCount", "totalUsers"],
         start_date=start_date, end_date=end_date,
-        limit=200
+        limit=500,
+        url_filter=url_filter
     )
     noise_events = {'session_start', 'first_visit', 'page_view', 'user_engagement', 'scroll'}
 
     if urls:
-        url_paths = set()
-        for u in urls:
-            path = urlparse(u).path.rstrip('/') or '/'
-            url_paths.add(path)
-        rows = [r for r in rows if r.get('pagePath', '').rstrip('/') in url_paths]
         agg = {}
         for r in rows:
             name = r['eventName']
@@ -313,31 +358,63 @@ def get_event_data(client, property_id, start_date, end_date, urls=None):
 
 
 def get_landing_pages(client, property_id, start_date, end_date, urls=None):
-    rows = run_ga4_report(
-        client, property_id,
-        dimensions=["landingPage", "sessionDefaultChannelGroup"],
-        metrics=["sessions", "totalUsers", "bounceRate", "engagementRate", "averageSessionDuration"],
-        start_date=start_date, end_date=end_date,
-        limit=100
-    )
+    url_filter = None
     if urls:
         url_paths = set()
         for u in urls:
             path = urlparse(u).path.rstrip('/') or '/'
             url_paths.add(path)
-        rows = [r for r in rows if r.get('landingPage', '').rstrip('/') in url_paths]
+        # Landing page dimension is "landingPage" not "pagePath" — build filter manually
+        paths = list(url_paths)
+        if len(paths) == 1:
+            url_filter = FilterExpression(
+                filter=Filter(
+                    field_name="landingPage",
+                    string_filter=Filter.StringFilter(
+                        match_type=Filter.StringFilter.MatchType.EXACT,
+                        value=paths[0],
+                        case_sensitive=False
+                    )
+                )
+            )
+        else:
+            url_filter = FilterExpression(
+                or_group=FilterExpressionList(
+                    expressions=[
+                        FilterExpression(
+                            filter=Filter(
+                                field_name="landingPage",
+                                string_filter=Filter.StringFilter(
+                                    match_type=Filter.StringFilter.MatchType.EXACT,
+                                    value=p,
+                                    case_sensitive=False
+                                )
+                            )
+                        )
+                        for p in paths
+                    ]
+                )
+            )
+
+    rows = run_ga4_report(
+        client, property_id,
+        dimensions=["landingPage", "sessionDefaultChannelGroup"],
+        metrics=["sessions", "totalUsers", "bounceRate", "engagementRate", "averageSessionDuration"],
+        start_date=start_date, end_date=end_date,
+        limit=500,
+        url_filter=url_filter
+    )
     return rows
 
 
 def get_exit_pages(client, property_id, start_date, end_date):
-    rows = run_ga4_report(
+    return run_ga4_report(
         client, property_id,
         dimensions=["pagePath"],
         metrics=["sessions"],
         start_date=start_date, end_date=end_date,
         limit=50
     )
-    return rows
 
 
 def get_geographic_data(client, property_id, start_date, end_date):
@@ -360,6 +437,14 @@ def get_time_of_day(client, property_id, start_date, end_date):
 
 
 def get_user_acquisition(client, property_id, start_date, end_date, urls=None):
+    url_filter = None
+    if urls:
+        url_paths = set()
+        for u in urls:
+            path = urlparse(u).path.rstrip('/') or '/'
+            url_paths.add(path)
+        url_filter = build_url_filter(url_paths)
+
     dimensions = ["sessionDefaultChannelGroup", "sessionSource", "sessionMedium", "pagePath"] if urls else \
                  ["sessionDefaultChannelGroup", "sessionSource", "sessionMedium"]
     rows = run_ga4_report(
@@ -367,14 +452,10 @@ def get_user_acquisition(client, property_id, start_date, end_date, urls=None):
         dimensions=dimensions,
         metrics=["newUsers", "sessions", "engagementRate", "bounceRate", "averageSessionDuration"],
         start_date=start_date, end_date=end_date,
-        limit=200
+        limit=500,
+        url_filter=url_filter
     )
     if urls:
-        url_paths = set()
-        for u in urls:
-            path = urlparse(u).path.rstrip('/') or '/'
-            url_paths.add(path)
-        rows = [r for r in rows if r.get('pagePath', '').rstrip('/') in url_paths]
         agg = {}
         for r in rows:
             key = (r['sessionDefaultChannelGroup'], r['sessionSource'], r['sessionMedium'])
@@ -428,7 +509,6 @@ def aggregate_pages_to_totals(pages):
     total_new_users = sum(p['newUsers'] for p in pages)
     total_engaged = sum(p['engagedSessions'] for p in pages)
     total_events = sum(p['eventCount'] for p in pages)
-    total_engagement_dur = sum(p.get('userEngagementDuration', 0) for p in pages)
 
     if total_sessions > 0:
         avg_bounce = sum(p['bounceRate'] * p['sessions'] for p in pages) / total_sessions
@@ -508,15 +588,8 @@ def collect_all_data(client, property_id, urls=None):
             curr_val = current_totals.get(metric, 0)
             prev_val = previous_totals.get(metric, 0)
             if isinstance(curr_val, (int, float)) and isinstance(prev_val, (int, float)):
-                if prev_val > 0:
-                    pct_change = round(((curr_val - prev_val) / prev_val) * 100, 1)
-                else:
-                    pct_change = None
-                changes[metric] = {
-                    "current": curr_val,
-                    "previous": prev_val,
-                    "change_pct": pct_change
-                }
+                pct_change = round(((curr_val - prev_val) / prev_val) * 100, 1) if prev_val > 0 else None
+                changes[metric] = {"current": curr_val, "previous": prev_val, "change_pct": pct_change}
 
         all_data[period_key] = {
             "label": period["label"],
@@ -785,7 +858,6 @@ def build_data_summary(all_data, periods, urls=None):
 def analyze_with_claude(all_data, periods, claude_api_key, urls=None, context=None):
     try:
         client = anthropic.Anthropic(api_key=claude_api_key)
-
         data_summary = build_data_summary(all_data, periods, urls)
 
         system_prompt = """You are a senior digital analytics consultant who produces clear, data-driven website performance reports. Your reports are valued because every insight is tied to a specific number from the data, and every recommendation explains exactly what to do and why it will work.
@@ -807,96 +879,76 @@ IMPORTANT FORMATTING RULES:
         is_location_report = urls and len(urls) > 3 and all('find-a-gym' in u or 'location' in u or 'club' in u for u in urls[:3])
         location_context = """
 IMPORTANT: The URLs being analysed are individual gym/venue location pages. Each page represents a physical location.
-When analysing these pages:
-- Treat each page as representing a physical gym location, not just a web page
 - "Sessions" = people researching that specific gym location
-- High bounce rate on a location page may mean people found what they needed quickly (address, opening hours) — context matters
+- High bounce rate on a location page may mean people found what they needed quickly (address, opening hours)
 - Compare locations against each other to identify which gyms are attracting the most online interest
 - Low traffic to a location page may indicate that gym needs more local SEO or marketing support
-- Session duration on location pages matters — longer = more consideration/research intent
 """ if is_location_report else ""
 
         user_prompt = f"""Analyse the following GA4 website analytics data and produce a comprehensive performance report.
 
-{f'BUSINESS CONTEXT: {context}' if context else 'No specific business context provided — analyse from a general digital performance perspective.'}
+{f'BUSINESS CONTEXT: {context}' if context else 'No specific business context provided.'}
 
 {f'SPECIFIC URLs REQUESTED: {", ".join(urls)}' if urls else 'Analyse all pages in the data.'}
 {location_context}
-The data is structured in three blocks. Each block must have its own dedicated section in the report:
+The data is structured in three blocks:
 - BLOCK 1: Last 7 days — standalone snapshot, no comparison required
-- BLOCK 2: Last 28 days vs previous 28 days (same period last month)
-- BLOCK 3: Last 28 days vs same period last year (year-on-year)
+- BLOCK 2: Last 28 days vs previous 28 days
+- BLOCK 3: Last 28 days vs same period last year
 
 {data_summary}
 
-REPORT STRUCTURE — follow this exactly:
+REPORT STRUCTURE:
 
 1. EXECUTIVE SUMMARY
-   - 3-4 sentence overview of overall performance across all three time blocks
-   - Include the single most important finding
-   - State whether things are improving or declining, citing both the 28-day and YoY comparisons
-   {"- If analysing location pages, identify the top and bottom performing locations by sessions" if is_location_report else ""}
+   - 3-4 sentence overview across all three time blocks
+   - Single most important finding
+   - Whether things are improving or declining with specific numbers
+   {"- Identify top and bottom performing locations by sessions" if is_location_report else ""}
 
-2. LAST 7 DAYS — PERFORMANCE SNAPSHOT (Block 1, no comparison)
-   - Current state of each page: sessions, users, engagement rate, bounce rate, session duration
-   - Top traffic sources and device split for this week
+2. LAST 7 DAYS — PERFORMANCE SNAPSHOT
+   - Sessions, users, engagement rate, bounce rate, session duration per page
+   - Top traffic sources and device split
    - Top geographic locations
-   - Key observations about user behaviour right now
-   - For each finding, add a "Plain English" box
+   - Plain English box for each finding
 
-3. LAST 28 DAYS vs PREVIOUS 28 DAYS — MONTH-ON-MONTH TRENDS (Block 2)
-   - Answer: "How is the number of users trending vs last month?"
-   - For each page: show current vs previous with % change, call out improvements or declines
-   - Break down new vs returning users and what that ratio means
-   - Identify which acquisition channels are growing or shrinking
-   - Lead generation signals: conversion events, engagement patterns, proxy signals for intent
-   - For each finding, add a "Plain English" box
+3. LAST 28 DAYS vs PREVIOUS 28 DAYS
+   - How user numbers are trending vs last month
+   - Per-page current vs previous with % change
+   - New vs returning users breakdown
+   - Acquisition channel trends
+   - Lead generation signals
+   - Plain English box for each finding
 
-4. LAST 28 DAYS vs SAME PERIOD LAST YEAR — YEAR-ON-YEAR ANALYSIS (Block 3)
-   - Answer: "How does this period compare to the same time last year?"
-   - For each page: show current vs last year with % change
-   - Identify seasonal patterns, long-term growth or decline
-   - Structural changes in user behaviour year-on-year
-   - For each finding, add a "Plain English" box
+4. LAST 28 DAYS vs SAME PERIOD LAST YEAR
+   - Per-page current vs last year with % change
+   - Seasonal patterns and long-term trends
+   - Note clearly if a page is too new for year-on-year comparison
+   - Plain English box for each finding
 
-5. PAGE/LOCATION PERFORMANCE SUMMARY
-   - Answer: "{"Which locations are performing best and worst?" if is_location_report else "What content is being best received?"}"
-   - Compare {"all gym location pages" if is_location_report else "pages"} against each other using 28-day data: best engagement rate, lowest bounce rate, longest session duration
-   - {"Rank all locations from best to worst performing and explain what might drive the differences" if is_location_report else "Which pages are most effective at keeping users?"}
-   - Create an HTML comparison table with columns: {"Location" if is_location_report else "Page"}, Sessions (28d), Bounce Rate, Engagement Rate, Avg Duration, vs Last Month, vs Last Year, Verdict
-   - Include ALL pages/locations provided — do not truncate the table
-   - For each finding, add a "Plain English" box
+5. PAGE PERFORMANCE SUMMARY
+   - HTML comparison table: Page, Sessions (28d), Bounce Rate, Engagement Rate, Avg Duration, vs Last Month, vs Last Year, Verdict
+   - Include ALL pages — do not truncate
+   - Plain English box
 
 6. ACTIONABLE RECOMMENDATIONS
-   Group into three priorities:
-   a) DO THIS WEEK (quick wins, high impact, low effort)
-   b) DO THIS MONTH (medium effort, significant impact)
-   c) PLAN FOR NEXT QUARTER (strategic, requires resources)
+   a) DO THIS WEEK
+   b) DO THIS MONTH
+   c) PLAN FOR NEXT QUARTER
+   Each must reference a specific metric and explain exactly what to do.
 
-   Each recommendation MUST:
-   - Reference a specific metric from the data
-   - Explain exactly what to do with specifics (not "improve SEO" but "add localised content to the /find-a-gym/bangor page which has only 45 sessions vs the London average of 2,400")
-   - Estimate the potential impact where possible
-   {"- At least 2 recommendations should address specific underperforming locations" if is_location_report else ""}
-
-CRITICAL RULES:
-- Every claim must reference a specific number from the data. No vague statements.
-- If a metric looks anomalous, flag it and explain possible causes.
-- When comparing pages/locations, always state which is better and by how much.
-- The "Plain English" boxes should be written as if explaining to a business owner who doesn't know analytics terminology. Use a <div> with style="background-color: #f0f7ff; border-left: 4px solid #4285F4; padding: 12px; margin: 10px 0; border-radius: 4px;" for these boxes.
-- Format all percentages to 1 decimal place. Format all numbers with commas for thousands.
-- If data seems insufficient or unusual, say so honestly rather than making up interpretations.
-- The comparison table in section 5 MUST include every single location/page — do not say "top X" or truncate."""
+RULES:
+- Every claim must cite a specific number. No vague statements.
+- Plain English boxes use: <div style="background-color: #f0f7ff; border-left: 4px solid #4285F4; padding: 12px; margin: 10px 0; border-radius: 4px;">
+- Format percentages to 1 decimal place. Numbers with commas for thousands.
+- If data is insufficient or anomalous, say so honestly."""
 
         message = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=8000,
-            messages=[
-                {"role": "user", "content": user_prompt}
-            ],
+            messages=[{"role": "user", "content": user_prompt}],
             system=system_prompt
         )
-
         return message.content[0].text
 
     except Exception as e:
@@ -909,7 +961,6 @@ CRITICAL RULES:
 
 def generate_charts(all_data):
     charts = {}
-
     try:
         current_pages = all_data.get("page_performance", {}).get("current", [])
         pages_sorted = sorted(current_pages, key=lambda x: x['sessions'], reverse=True)[:8]
@@ -918,64 +969,64 @@ def generate_charts(all_data):
             page_names = [p['pagePath'][:35] + ('...' if len(p['pagePath']) > 35 else '') for p in pages_sorted]
             sessions = [p['sessions'] for p in pages_sorted]
 
-            fig1 = go.Figure(data=[
-                go.Bar(y=page_names, x=sessions, orientation='h',
-                       marker=dict(color='#4285F4'),
-                       text=sessions, textposition='outside')
-            ])
+            fig1 = go.Figure(data=[go.Bar(
+                y=page_names, x=sessions, orientation='h',
+                marker=dict(color='#4285F4'), text=sessions, textposition='outside'
+            )])
             fig1.update_layout(
-                title='Sessions by page (last 28 days)',
-                xaxis_title='Sessions',
+                title='Sessions by page (last 28 days)', xaxis_title='Sessions',
                 yaxis=dict(autorange="reversed"),
                 height=max(300, len(pages_sorted) * 50 + 100),
-                margin=dict(l=200, r=80, t=60, b=50),
-                font=dict(size=12)
+                margin=dict(l=200, r=80, t=60, b=50), font=dict(size=12)
             )
             img = pio.to_image(fig1, format='png', width=800, height=max(300, len(pages_sorted) * 50 + 100))
             charts['sessions_chart'] = base64.b64encode(img).decode()
 
-        if pages_sorted:
             bounce_rates = [p['bounceRate'] * 100 for p in pages_sorted]
             colors = ['#EA4335' if br > 60 else '#FBBC04' if br > 40 else '#34A853' for br in bounce_rates]
-
-            fig2 = go.Figure(data=[
-                go.Bar(y=page_names, x=bounce_rates, orientation='h',
-                       marker=dict(color=colors),
-                       text=[f"{br:.1f}%" for br in bounce_rates], textposition='outside')
-            ])
+            fig2 = go.Figure(data=[go.Bar(
+                y=page_names, x=bounce_rates, orientation='h',
+                marker=dict(color=colors),
+                text=[f"{br:.1f}%" for br in bounce_rates], textposition='outside'
+            )])
             fig2.update_layout(
-                title='Bounce rate by page (%)',
-                xaxis_title='Bounce Rate (%)',
+                title='Bounce rate by page (%)', xaxis_title='Bounce Rate (%)',
                 yaxis=dict(autorange="reversed"),
                 height=max(300, len(pages_sorted) * 50 + 100),
-                margin=dict(l=200, r=80, t=60, b=50),
-                font=dict(size=12)
+                margin=dict(l=200, r=80, t=60, b=50), font=dict(size=12)
             )
             fig2.add_vline(x=50, line_dash="dash", line_color="gray", opacity=0.5)
             img = pio.to_image(fig2, format='png', width=800, height=max(300, len(pages_sorted) * 50 + 100))
             charts['bounce_rate_chart'] = base64.b64encode(img).decode()
 
+            eng_rates = [p['engagementRate'] * 100 for p in pages_sorted]
+            eng_colors = ['#34A853' if er > 60 else '#FBBC04' if er > 40 else '#EA4335' for er in eng_rates]
+            fig5 = go.Figure(data=[go.Bar(
+                y=page_names, x=eng_rates, orientation='h',
+                marker=dict(color=eng_colors),
+                text=[f"{er:.1f}%" for er in eng_rates], textposition='outside'
+            )])
+            fig5.update_layout(
+                title='Engagement rate by page (%)', xaxis_title='Engagement Rate (%)',
+                yaxis=dict(autorange="reversed"),
+                height=max(300, len(pages_sorted) * 50 + 100),
+                margin=dict(l=200, r=80, t=60, b=50), font=dict(size=12)
+            )
+            img = pio.to_image(fig5, format='png', width=800, height=max(300, len(pages_sorted) * 50 + 100))
+            charts['engagement_chart'] = base64.b64encode(img).decode()
+
         device_totals = {}
         for page in current_pages:
             for dev, sess in page.get('devices', {}).items():
                 device_totals[dev] = device_totals.get(dev, 0) + sess
-
         if device_totals:
-            fig3 = go.Figure(data=[
-                go.Pie(
-                    labels=list(device_totals.keys()),
-                    values=list(device_totals.values()),
-                    marker=dict(colors=['#4285F4', '#EA4335', '#FBBC04', '#34A853']),
-                    textinfo='label+percent',
-                    textposition='inside'
-                )
-            ])
-            fig3.update_layout(
-                title='Traffic by device type',
-                height=400,
-                margin=dict(l=50, r=50, t=60, b=50),
-                font=dict(size=13)
-            )
+            fig3 = go.Figure(data=[go.Pie(
+                labels=list(device_totals.keys()), values=list(device_totals.values()),
+                marker=dict(colors=['#4285F4', '#EA4335', '#FBBC04', '#34A853']),
+                textinfo='label+percent', textposition='inside'
+            )])
+            fig3.update_layout(title='Traffic by device type', height=400,
+                               margin=dict(l=50, r=50, t=60, b=50), font=dict(size=13))
             img = pio.to_image(fig3, format='png', width=600, height=400)
             charts['device_chart'] = base64.b64encode(img).decode()
 
@@ -984,46 +1035,19 @@ def generate_charts(all_data):
         for a in acq:
             ch = a['sessionDefaultChannelGroup']
             ch_agg[ch] = ch_agg.get(ch, 0) + a['sessions']
-
         if ch_agg:
             ch_sorted = sorted(ch_agg.items(), key=lambda x: -x[1])[:8]
-            ch_names = [c[0] for c in ch_sorted]
-            ch_sessions = [c[1] for c in ch_sorted]
-
-            fig4 = go.Figure(data=[
-                go.Bar(x=ch_names, y=ch_sessions,
-                       marker=dict(color='#34A853'),
-                       text=ch_sessions, textposition='outside')
-            ])
+            fig4 = go.Figure(data=[go.Bar(
+                x=[c[0] for c in ch_sorted], y=[c[1] for c in ch_sorted],
+                marker=dict(color='#34A853'),
+                text=[c[1] for c in ch_sorted], textposition='outside'
+            )])
             fig4.update_layout(
-                title='Sessions by acquisition channel',
-                yaxis_title='Sessions',
-                height=400,
-                margin=dict(l=60, r=50, t=60, b=80),
-                font=dict(size=12)
+                title='Sessions by acquisition channel', yaxis_title='Sessions',
+                height=400, margin=dict(l=60, r=50, t=60, b=80), font=dict(size=12)
             )
             img = pio.to_image(fig4, format='png', width=800, height=400)
             charts['acquisition_chart'] = base64.b64encode(img).decode()
-
-        if pages_sorted:
-            eng_rates = [p['engagementRate'] * 100 for p in pages_sorted]
-            eng_colors = ['#34A853' if er > 60 else '#FBBC04' if er > 40 else '#EA4335' for er in eng_rates]
-
-            fig5 = go.Figure(data=[
-                go.Bar(y=page_names, x=eng_rates, orientation='h',
-                       marker=dict(color=eng_colors),
-                       text=[f"{er:.1f}%" for er in eng_rates], textposition='outside')
-            ])
-            fig5.update_layout(
-                title='Engagement rate by page (%)',
-                xaxis_title='Engagement Rate (%)',
-                yaxis=dict(autorange="reversed"),
-                height=max(300, len(pages_sorted) * 50 + 100),
-                margin=dict(l=200, r=80, t=60, b=50),
-                font=dict(size=12)
-            )
-            img = pio.to_image(fig5, format='png', width=800, height=max(300, len(pages_sorted) * 50 + 100))
-            charts['engagement_chart'] = base64.b64encode(img).decode()
 
     except Exception as e:
         print(f"Error generating charts: {str(e)}", flush=True)
