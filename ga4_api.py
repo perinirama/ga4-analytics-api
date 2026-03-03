@@ -700,9 +700,98 @@ IMPORTANT FORMATTING RULES:
 - Do NOT use markdown formatting. Only HTML.
 - Do NOT include <html>, <head>, or <body> tags — just the content HTML."""
 
-        # Detect if this is a multi-location gym/venue report
-        is_location_report = urls and len(urls) > 3 and all('find-a-gym' in u or 'location' in u or 'club' in u for u in urls[:3])
-        location_context = """
+        # ============================================================
+        # REPORT MODE DETECTION
+        # - Focused mode: client provided a business question AND specific URLs
+        # - Location mode: 4+ gym/venue location URLs, no specific question
+        # - General mode: no URLs or no context — full site report
+        # ============================================================
+        is_focused_question = bool(context and context.strip() and urls and len(urls) > 0)
+
+        is_location_report = (
+            not is_focused_question
+            and urls
+            and len(urls) > 3
+            and all('find-a-gym' in u or 'location' in u or 'club' in u for u in urls[:3])
+        )
+
+        # ============================================================
+        # FOCUSED QUESTION REPORT
+        # Used when the client asks a specific business question
+        # about one or more specific pages. The report answers that
+        # question directly rather than producing a generic site overview.
+        # ============================================================
+        if is_focused_question:
+            focused_urls_str = ", ".join(urls)
+            user_prompt = f"""Analyse the following GA4 website analytics data and produce a focused report that directly answers the client's business question.
+
+BUSINESS QUESTION: {context}
+
+FOCUS URLs: {focused_urls_str}
+
+REPORTING PERIOD: Last 28 days compared to previous 28 days and same period last year.
+
+{data_summary}
+
+CRITICAL INSTRUCTION: The client has asked a specific business question about specific pages. This is NOT a request for a general site-wide report. Every section must directly relate to answering that question. Do not include unrelated site-wide metrics unless they directly contextualise the answer.
+
+REPORT STRUCTURE — follow this exactly:
+
+1. DIRECT ANSWER
+   - Open by answering the business question directly in 2-3 sentences using exact numbers from the data
+   - State the single most important finding
+   - Be specific — no generalisations
+
+2. PAGE BEHAVIOUR ANALYSIS
+   - Traffic volume, trend (28d vs previous, YoY), and top acquisition sources for the focus URL(s)
+   - Session duration, engagement rate, and bounce rate — are these good or poor for this type of page?
+   - Device breakdown — what proportion are on mobile vs desktop?
+   - New vs returning users — who is landing here?
+   - Are users progressing to the intended next step described in the business question? Reference the data.
+   - For each finding, add a "Plain English" box explaining what it means for the business
+
+3. CONVERSION & INTENT ANALYSIS
+   - Are users taking the intended action described in the business question?
+   - List any events fired on or from these pages and what they indicate
+   - What percentage of visitors show intent signals vs drop off?
+   - If direct conversion data is unavailable, identify the strongest proxy signals (pages per session, engagement duration, specific events)
+   - For each finding, add a "Plain English" box
+
+4. BARRIERS & DROP-OFF POINTS
+   - What is preventing users from completing the intended journey?
+   - Flag any anomalous metrics (e.g. very low session duration, high bounce rate, traffic spike without conversions) and explain the most likely cause
+   - For each finding, add a "Plain English" box
+
+5. SUPPORTING CONTEXT
+   - Provide 2-3 brief observations from the wider site data that are directly relevant to understanding the focus pages
+   - Do NOT include unrelated site-wide metrics — this section exists for context only, not as a full site report
+
+6. ACTIONABLE RECOMMENDATIONS
+   All recommendations must directly address the business question and focus URLs.
+   Group into three priorities:
+   a) DO THIS WEEK (quick wins, high impact, low effort)
+   b) DO THIS MONTH (medium effort, significant impact)
+   c) PLAN FOR NEXT QUARTER (strategic, requires resources)
+
+   Each recommendation MUST:
+   - Reference a specific metric from the data
+   - Explain exactly what to do with specifics (e.g. "Add a prominent CTA button above the fold on /able/bioage linking to /discover-your-bioage — 93.9% of the 16,547 visitors are on mobile and the 10.3s session duration suggests they are not finding the next step")
+   - Estimate the potential impact where possible
+
+CRITICAL RULES:
+- Every claim must reference a specific number from the data. No vague statements.
+- If a metric looks anomalous, flag it and explain possible causes.
+- The "Plain English" boxes should be written as if explaining to a business owner who does not know analytics terminology. Use a <div> with style="background-color: #f0f7ff; border-left: 4px solid #4285F4; padding: 12px; margin: 10px 0; border-radius: 4px;" for these boxes.
+- Format all percentages to 1 decimal place. Format all numbers with commas for thousands.
+- If data seems insufficient or unusual, say so honestly rather than making up interpretations."""
+
+        # ============================================================
+        # FULL SITE / LOCATION REPORT
+        # Used when no specific business question is asked.
+        # Produces the comprehensive 6-section site-wide report.
+        # ============================================================
+        else:
+            location_context = """
 IMPORTANT: The URLs being analysed are individual gym/venue location pages. Each page represents a physical location.
 When analysing these pages:
 - Treat each page as representing a physical gym location, not just a web page
@@ -713,7 +802,7 @@ When analysing these pages:
 - Session duration on location pages matters — longer = more consideration/research intent
 """ if is_location_report else ""
 
-        user_prompt = f"""Analyse the following GA4 website analytics data and produce a comprehensive performance report.
+            user_prompt = f"""Analyse the following GA4 website analytics data and produce a comprehensive performance report.
 
 {f'BUSINESS CONTEXT: {context}' if context else 'No specific business context provided — analyse from a general digital performance perspective.'}
 
