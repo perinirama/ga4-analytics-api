@@ -491,20 +491,25 @@ def aggregate_pages_to_totals(pages):
 
 def collect_all_data(client, property_id, urls=None):
     """
-    Collect GA4 data across three comparison periods:
-    - Last 28 days vs previous 28 days
+    Collect GA4 data across three reporting blocks:
+    - Last 7 days: standalone snapshot, no comparison
+    - Last 28 days vs previous 28 days (same period last month)
     - Last 28 days vs same 28 days last year (YoY)
-    - Last 90 days vs previous 90 days
     """
     now = datetime.now()
 
     periods = {
+        "last_7_days": {
+            "current_start": now - timedelta(days=7),
+            "current_end": now,
+            "label": f"Last 7 days ({(now - timedelta(days=7)).strftime('%d %b')} – {now.strftime('%d %b %Y')})"
+        },
         "last_28_days": {
             "current_start": now - timedelta(days=28),
             "current_end": now,
             "previous_start": now - timedelta(days=56),
             "previous_end": now - timedelta(days=28),
-            "label": "Last 28 days"
+            "label": "Last 28 days vs previous 28 days"
         },
         "year_over_year": {
             "current_start": now - timedelta(days=28),
@@ -513,27 +518,19 @@ def collect_all_data(client, property_id, urls=None):
             "previous_end": now - timedelta(days=365),
             "label": "Last 28 days vs same period last year"
         },
-        "last_90_days": {
-            "current_start": now - timedelta(days=90),
-            "current_end": now,
-            "previous_start": now - timedelta(days=180),
-            "previous_end": now - timedelta(days=90),
-            "label": "Last 90 days"
-        }
     }
 
     all_data = {}
 
-    for period_key, period in periods.items():
+    # ── last_28_days and year_over_year: compute totals with comparisons ──
+    for period_key in ["last_28_days", "year_over_year"]:
+        period = periods[period_key]
         cs = period["current_start"]
         ce = period["current_end"]
         ps = period["previous_start"]
         pe = period["previous_end"]
 
-        # BUG FIX: When specific URLs are requested, compute period totals
-        # from those pages only — not the whole site. Previously get_site_totals
-        # always returned site-wide numbers regardless of the URLs requested,
-        # causing inflated figures and wrong % changes in the report.
+        # When specific URLs are requested, compute totals from those pages only
         if urls:
             current_pages = get_page_performance(client, property_id, cs, ce, urls)
             previous_pages = get_page_performance(client, property_id, ps, pe, urls)
@@ -568,6 +565,17 @@ def collect_all_data(client, property_id, urls=None):
         }
 
     # Detailed data for primary period (last 28 days)
+    # ── 7-day standalone block ──────────────────────────────
+    cs7 = periods["last_7_days"]["current_start"]
+    ce7 = periods["last_7_days"]["current_end"]
+    all_data["last_7_days"] = {
+        "label": periods["last_7_days"]["label"],
+        "page_performance": get_page_performance(client, property_id, cs7, ce7, urls),
+        "devices": get_user_acquisition(client, property_id, cs7, ce7, urls),
+        "geographic": get_geographic_data(client, property_id, cs7, ce7),
+    }
+
+    # ── 28-day detailed data (current vs previous) ──────────
     cs28 = periods["last_28_days"]["current_start"]
     ce28 = periods["last_28_days"]["current_end"]
     ps28 = periods["last_28_days"]["previous_start"]
@@ -584,7 +592,7 @@ def collect_all_data(client, property_id, urls=None):
     all_data["time_of_day"] = get_time_of_day(client, property_id, cs28, ce28)
     all_data["acquisition"] = get_user_acquisition(client, property_id, cs28, ce28, urls)
 
-    # YoY page performance for comparison
+    # ── YoY: same 28-day window last year ───────────────────
     cs_yoy = periods["year_over_year"]["previous_start"]
     ce_yoy = periods["year_over_year"]["previous_end"]
     all_data["page_performance_yoy"] = get_page_performance(client, property_id, cs_yoy, ce_yoy, urls)
@@ -599,45 +607,74 @@ def collect_all_data(client, property_id, urls=None):
 def build_data_summary(all_data, periods, urls=None):
     """
     Build a structured text summary of all GA4 data for the AI prompt.
+    Three blocks: 7-day snapshot, 28-day vs last month, 28-day vs last year.
     """
     lines = []
 
+    # ── BLOCK 1: Last 7 days standalone ─────────────────────
     lines.append("=" * 60)
-    lines.append("SITE-LEVEL TRENDS ACROSS PERIODS")
+    lines.append(f"BLOCK 1 — {all_data.get('last_7_days', {}).get('label', 'Last 7 days')} — STANDALONE SNAPSHOT (no comparison)")
     lines.append("=" * 60)
 
-    for period_key in ["last_28_days", "year_over_year", "last_90_days"]:
-        pd = all_data[period_key]
-        lines.append(f"\n--- {pd['label']} ---")
-        lines.append(f"Current period: {pd['date_range']['current']}")
-        lines.append(f"Comparison period: {pd['date_range']['previous']}")
+    pages_7d = all_data.get("last_7_days", {}).get("page_performance", [])
+    pages_7d_sorted = sorted(pages_7d, key=lambda x: x['sessions'], reverse=True)
+    page_limit_7d = len(pages_7d_sorted) if urls else 20
 
-        totals = pd.get("totals", {})
-        for metric, vals in totals.items():
-            curr = vals['current']
-            prev = vals['previous']
-            pct = vals['change_pct']
-            pct_str = f"{pct:+.1f}%" if pct is not None else "N/A"
+    for page in pages_7d_sorted[:page_limit_7d]:
+        path = page['pagePath']
+        lines.append(f"\n  Page: {path}")
+        lines.append(f"    Sessions: {page['sessions']:,}")
+        lines.append(f"    Users: {page['totalUsers']:,} (new: {page['newUsers']:,}, returning: {page.get('returningUsers', 0):,})")
+        lines.append(f"    Bounce rate: {page['bounceRate']:.1%}")
+        lines.append(f"    Engagement rate: {page['engagementRate']:.1%}")
+        lines.append(f"    Avg session duration: {page['averageSessionDuration']:.1f}s")
+        lines.append(f"    Avg engagement duration: {page.get('avgEngagementDuration', 0):.1f}s")
+        lines.append(f"    Pages per session: {page.get('pagesPerSession', 0):.1f}")
+        lines.append(f"    Events fired: {page['eventCount']:,}")
+        devices = page.get('devices', {})
+        if devices:
+            dev_str = ", ".join(f"{k}: {v}" for k, v in sorted(devices.items(), key=lambda x: -x[1]))
+            lines.append(f"    Devices: {dev_str}")
+        channels = page.get('channels', {})
+        if channels:
+            ch_str = ", ".join(f"{k}: {v}" for k, v in sorted(channels.items(), key=lambda x: -x[1])[:5])
+            lines.append(f"    Top channels: {ch_str}")
 
-            if metric in ('bounceRate', 'engagementRate'):
-                lines.append(f"  {metric}: {curr:.1%} (was {prev:.1%}, change: {pct_str})")
-            elif metric == 'averageSessionDuration':
-                lines.append(f"  {metric}: {curr:.1f}s (was {prev:.1f}s, change: {pct_str})")
-            else:
-                lines.append(f"  {metric}: {curr:,} (was {prev:,}, change: {pct_str})")
+    geo_7d = all_data.get("last_7_days", {}).get("geographic", [])
+    if geo_7d:
+        lines.append("\n  Top cities (last 7 days):")
+        for g in sorted(geo_7d, key=lambda x: x['sessions'], reverse=True)[:5]:
+            lines.append(f"    {g['city']}, {g['country']}: {g['sessions']:,} sessions (engagement: {g['engagementRate']:.1%})")
 
+    # ── BLOCK 2: Last 28 days vs previous 28 days ────────────
     lines.append("\n" + "=" * 60)
-    lines.append("PAGE PERFORMANCE — LAST 7 DAYS")
+    lines.append("BLOCK 2 — LAST 28 DAYS vs PREVIOUS 28 DAYS (same period last month)")
     lines.append("=" * 60)
 
+    pd28 = all_data.get("last_28_days", {})
+    lines.append(f"Current period: {pd28.get('date_range', {}).get('current', '')}")
+    lines.append(f"Comparison period: {pd28.get('date_range', {}).get('previous', '')}")
+
+    totals28 = pd28.get("totals", {})
+    for metric, vals in totals28.items():
+        curr = vals['current']
+        prev = vals['previous']
+        pct = vals['change_pct']
+        pct_str = f"{pct:+.1f}%" if pct is not None else "N/A"
+        if metric in ('bounceRate', 'engagementRate'):
+            lines.append(f"  {metric}: {curr:.1%} (was {prev:.1%}, change: {pct_str})")
+        elif metric == 'averageSessionDuration':
+            lines.append(f"  {metric}: {curr:.1f}s (was {prev:.1f}s, change: {pct_str})")
+        else:
+            lines.append(f"  {metric}: {curr:,} (was {prev:,}, change: {pct_str})")
+
+    lines.append("\n  Per-page detail (last 28 days vs previous 28 days):")
     current_pages = all_data.get("page_performance", {}).get("current", [])
     previous_pages = all_data.get("page_performance", {}).get("previous", [])
     prev_lookup = {p['pagePath']: p for p in previous_pages}
-
     current_pages_sorted = sorted(current_pages, key=lambda x: x['sessions'], reverse=True)
-
-    # Show all pages when specific URLs were requested, otherwise cap at 30
     page_limit = len(current_pages_sorted) if urls else 30
+
     for page in current_pages_sorted[:page_limit]:
         path = page['pagePath']
         lines.append(f"\n  Page: {path}")
@@ -649,22 +686,14 @@ def build_data_summary(all_data, periods, urls=None):
         lines.append(f"    Avg engagement duration: {page.get('avgEngagementDuration', 0):.1f}s")
         lines.append(f"    Pages per session: {page.get('pagesPerSession', 0):.1f}")
         lines.append(f"    Events fired: {page['eventCount']:,}")
-
         devices = page.get('devices', {})
         if devices:
             dev_str = ", ".join(f"{k}: {v}" for k, v in sorted(devices.items(), key=lambda x: -x[1]))
             lines.append(f"    Devices: {dev_str}")
-
         channels = page.get('channels', {})
         if channels:
             ch_str = ", ".join(f"{k}: {v}" for k, v in sorted(channels.items(), key=lambda x: -x[1])[:5])
             lines.append(f"    Top channels: {ch_str}")
-
-        sources = page.get('sources', {})
-        if sources:
-            src_str = ", ".join(f"{k}: {v}" for k, v in sorted(sources.items(), key=lambda x: -x[1])[:5])
-            lines.append(f"    Top sources: {src_str}")
-
         prev = prev_lookup.get(path)
         if prev:
             s_change = page['sessions'] - prev['sessions']
@@ -672,23 +701,43 @@ def build_data_summary(all_data, periods, urls=None):
             lines.append(f"    vs previous 28 days: sessions {s_change:+,} ({s_pct:+.1f}%), "
                          f"bounce {page['bounceRate'] - prev['bounceRate']:+.1%}")
 
+    # ── BLOCK 3: Last 28 days vs same period last year ───────
     lines.append("\n" + "=" * 60)
-    lines.append("PAGE PERFORMANCE — SAME PERIOD LAST YEAR (YoY)")
+    lines.append("BLOCK 3 — LAST 28 DAYS vs SAME PERIOD LAST YEAR (year-on-year)")
     lines.append("=" * 60)
 
+    pdyoy = all_data.get("year_over_year", {})
+    lines.append(f"Current period: {pdyoy.get('date_range', {}).get('current', '')}")
+    lines.append(f"Comparison period (last year): {pdyoy.get('date_range', {}).get('previous', '')}")
+
+    totals_yoy = pdyoy.get("totals", {})
+    for metric, vals in totals_yoy.items():
+        curr = vals['current']
+        prev = vals['previous']
+        pct = vals['change_pct']
+        pct_str = f"{pct:+.1f}%" if pct is not None else "N/A"
+        if metric in ('bounceRate', 'engagementRate'):
+            lines.append(f"  {metric}: {curr:.1%} (was {prev:.1%}, change: {pct_str})")
+        elif metric == 'averageSessionDuration':
+            lines.append(f"  {metric}: {curr:.1f}s (was {prev:.1f}s, change: {pct_str})")
+        else:
+            lines.append(f"  {metric}: {curr:,} (was {prev:,}, change: {pct_str})")
+
+    lines.append("\n  Per-page detail (last 28 days vs same period last year):")
     pages_yoy = all_data.get("page_performance_yoy", [])
     pages_yoy_sorted = sorted(pages_yoy, key=lambda x: x['sessions'], reverse=True)
     yoy_limit = len(pages_yoy_sorted) if urls else 30
 
     for page in pages_yoy_sorted[:yoy_limit]:
         path = page['pagePath']
-        lines.append(f"\n  Page: {path}")
+        lines.append(f"\n  Page (last year): {path}")
         lines.append(f"    Sessions: {page['sessions']:,} | Users: {page['totalUsers']:,}")
         lines.append(f"    Bounce: {page['bounceRate']:.1%} | Engagement: {page['engagementRate']:.1%}")
         lines.append(f"    Avg duration: {page['averageSessionDuration']:.1f}s")
 
+    # ── Supporting data ──────────────────────────────────────
     lines.append("\n" + "=" * 60)
-    lines.append("USER EVENTS (excluding default GA4 events)")
+    lines.append("USER EVENTS (last 28 days, excluding default GA4 events)")
     lines.append("=" * 60)
 
     events = all_data.get("events", [])
@@ -697,7 +746,7 @@ def build_data_summary(all_data, periods, urls=None):
         lines.append(f"  {ev['eventName']}: {ev['eventCount']:,} events by {ev['totalUsers']:,} users")
 
     lines.append("\n" + "=" * 60)
-    lines.append("LANDING PAGES (entry points)")
+    lines.append("LANDING PAGES (last 28 days)")
     lines.append("=" * 60)
 
     landings = all_data.get("landing_pages", [])
@@ -709,13 +758,12 @@ def build_data_summary(all_data, periods, urls=None):
         lp_agg[path]["sessions"] += lp['sessions']
         ch = lp['sessionDefaultChannelGroup']
         lp_agg[path]["channels"][ch] = lp_agg[path]["channels"].get(ch, 0) + lp['sessions']
-
     for path, info in sorted(lp_agg.items(), key=lambda x: -x[1]['sessions'])[:10]:
         ch_str = ", ".join(f"{k}: {v}" for k, v in sorted(info['channels'].items(), key=lambda x: -x[1])[:3])
         lines.append(f"  {path}: {info['sessions']:,} sessions (channels: {ch_str})")
 
     lines.append("\n" + "=" * 60)
-    lines.append("GEOGRAPHIC BREAKDOWN")
+    lines.append("GEOGRAPHIC BREAKDOWN (last 28 days)")
     lines.append("=" * 60)
 
     geo = all_data.get("geographic", [])
@@ -725,14 +773,13 @@ def build_data_summary(all_data, periods, urls=None):
         country_agg[c] = country_agg.get(c, 0) + g['sessions']
     for country, sess in sorted(country_agg.items(), key=lambda x: -x[1])[:10]:
         lines.append(f"  {country}: {sess:,} sessions")
-
     geo_sorted = sorted(geo, key=lambda x: x['sessions'], reverse=True)
     lines.append("  Top cities:")
     for g in geo_sorted[:10]:
         lines.append(f"    {g['city']}, {g['country']}: {g['sessions']:,} sessions (engagement: {g['engagementRate']:.1%})")
 
     lines.append("\n" + "=" * 60)
-    lines.append("TRAFFIC PATTERNS BY TIME")
+    lines.append("TRAFFIC PATTERNS BY TIME (last 28 days)")
     lines.append("=" * 60)
 
     tod = all_data.get("time_of_day", [])
@@ -759,7 +806,7 @@ def build_data_summary(all_data, periods, urls=None):
                 lines.append(f"    {day_names[d]}: {day_agg[d]:,}")
 
     lines.append("\n" + "=" * 60)
-    lines.append("ACQUISITION CHANNELS")
+    lines.append("ACQUISITION CHANNELS (last 28 days)")
     lines.append("=" * 60)
 
     acq = all_data.get("acquisition", [])
@@ -827,48 +874,48 @@ When analysing these pages:
 
 {f'SPECIFIC URLs REQUESTED: {", ".join(urls)}' if urls else 'Analyse all pages in the data.'}
 {location_context}
-REPORTING PERIOD: Last 28 days compared to previous 28 days and same period last year.
+The data is structured in three blocks. Each block must have its own dedicated section in the report:
+- BLOCK 1: Last 7 days — standalone snapshot, no comparison required
+- BLOCK 2: Last 28 days vs previous 28 days (same period last month)
+- BLOCK 3: Last 28 days vs same period last year (year-on-year)
 
 {data_summary}
 
 REPORT STRUCTURE — follow this exactly:
 
 1. EXECUTIVE SUMMARY
-   - 3-4 sentence overview of overall performance
+   - 3-4 sentence overview of overall performance across all three time blocks
    - Include the single most important finding
-   - State whether things are improving or declining across the 28-day period and YoY
+   - State whether things are improving or declining, citing both the 28-day and YoY comparisons
    {"- If analysing location pages, identify the top and bottom performing locations by sessions" if is_location_report else ""}
 
-2. LEAD GENERATION & CONVERSION SIGNALS
-   - Answer: "How are we tracking from a hot lead/joiner perspective?"
-   - Look at conversion events, form submissions, contact events, booking events
-   - Analyse engagement patterns that indicate purchase/enquiry intent (high engagement duration, multiple pages per session, specific event triggers)
-   - If no explicit conversion events exist, identify proxy signals (engagement rate, session duration, pages per session, scroll events)
-   {"- For location pages: which gyms are generating the most high-intent visits (long session duration + high engagement)?" if is_location_report else ""}
-   - For each finding, add a "Plain English" box explaining what it means for the business
+2. LAST 7 DAYS — PERFORMANCE SNAPSHOT (Block 1, no comparison)
+   - Current state of each page: sessions, users, engagement rate, bounce rate, session duration
+   - Top traffic sources and device split for this week
+   - Top geographic locations
+   - Key observations about user behaviour right now
+   - For each finding, add a "Plain English" box
 
-3. USER TRENDS & TRAFFIC HEALTH
-   - Answer: "How is the number of users trending?"
-   - Compare 28-day vs previous 28 days AND year-over-year trends
+3. LAST 28 DAYS vs PREVIOUS 28 DAYS — MONTH-ON-MONTH TRENDS (Block 2)
+   - Answer: "How is the number of users trending vs last month?"
+   - For each page: show current vs previous with % change, call out improvements or declines
    - Break down new vs returning users and what that ratio means
    - Identify which acquisition channels are growing or shrinking
+   - Lead generation signals: conversion events, engagement patterns, proxy signals for intent
    - For each finding, add a "Plain English" box
 
-4. BEHAVIOUR & ENGAGEMENT ANALYSIS
-   - Answer: "How is website behaviour changing?"
-   - Session duration trends — are people spending more or less time?
-   - Bounce rate changes — are people leaving faster?
-   - Pages per session — are people exploring more?
-   - Device breakdown — how does mobile compare to desktop?
-   - Time-of-day and day-of-week patterns — when are users most active and engaged?
-   - Geographic patterns — where are the most engaged users?
+4. LAST 28 DAYS vs SAME PERIOD LAST YEAR — YEAR-ON-YEAR ANALYSIS (Block 3)
+   - Answer: "How does this period compare to the same time last year?"
+   - For each page: show current vs last year with % change
+   - Identify seasonal patterns, long-term growth or decline
+   - Structural changes in user behaviour year-on-year
    - For each finding, add a "Plain English" box
 
-5. PAGE/LOCATION PERFORMANCE
+5. PAGE/LOCATION PERFORMANCE SUMMARY
    - Answer: "{"Which locations are performing best and worst?" if is_location_report else "What content is being best received?"}"
-   - Compare {"all gym location pages" if is_location_report else "pages"} against each other: which have the best engagement rate, lowest bounce rate, longest session duration?
-   - {"Rank all locations from best to worst performing and explain what might drive the differences (e.g. London locations vs regional)" if is_location_report else "Which landing pages are most effective at keeping users?"}
-   - Create an HTML comparison table with columns: {"Location" if is_location_report else "Page"}, Sessions, Bounce Rate, Engagement Rate, Avg Duration, 28d vs Previous, Verdict
+   - Compare {"all gym location pages" if is_location_report else "pages"} against each other using 28-day data: best engagement rate, lowest bounce rate, longest session duration
+   - {"Rank all locations from best to worst performing and explain what might drive the differences" if is_location_report else "Which pages are most effective at keeping users?"}
+   - Create an HTML comparison table with columns: {"Location" if is_location_report else "Page"}, Sessions (28d), Bounce Rate, Engagement Rate, Avg Duration, vs Last Month, vs Last Year, Verdict
    - Include ALL pages/locations provided — do not truncate the table
    - For each finding, add a "Plain English" box
 
