@@ -159,7 +159,7 @@ def aggregate_basic(results):
 # GA4 DATA COLLECTION FUNCTIONS
 # ============================================================
 
-def run_ga4_report(client, property_id, dimensions, metrics, start_date, end_date, limit=500):
+def run_ga4_report(client, property_id, dimensions, metrics, start_date, end_date, limit=5000):
     request_params = RunReportRequest(
         property=f"properties/{property_id}",
         dimensions=[Dimension(name=d) for d in dimensions],
