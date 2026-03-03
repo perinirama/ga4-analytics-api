@@ -38,10 +38,6 @@ def health_check():
 
 @app.route('/analyze', methods=['POST'])
 def analyze_ga4():
-    """
-    Basic GA4 analysis endpoint (legacy).
-    Kept for backwards compatibility.
-    """
     try:
         data = request.get_json()
         if not data:
@@ -129,7 +125,6 @@ def analyze_ga4():
 
 
 def aggregate_basic(results):
-    """Basic aggregation for legacy endpoint"""
     aggregated = {}
     for row in results:
         path = row['pagePath']
@@ -165,9 +160,6 @@ def aggregate_basic(results):
 # ============================================================
 
 def run_ga4_report(client, property_id, dimensions, metrics, start_date, end_date, limit=500):
-    """
-    Generic GA4 report runner. Returns list of dicts.
-    """
     request_params = RunReportRequest(
         property=f"properties/{property_id}",
         dimensions=[Dimension(name=d) for d in dimensions],
@@ -199,13 +191,7 @@ def run_ga4_report(client, property_id, dimensions, metrics, start_date, end_dat
 
 
 def sanitise_url_list(raw_urls):
-    """
-    Sanitise and normalise a list of URLs.
-    Handles strings with newline/comma separators, strips control characters,
-    and normalises paths for exact matching.
-    """
     if isinstance(raw_urls, str):
-        # Split on newlines, carriage returns, or commas
         raw_urls = re.split(r'[\n\r,]+', raw_urls)
 
     cleaned = []
@@ -217,10 +203,8 @@ def sanitise_url_list(raw_urls):
 
 
 def get_page_performance(client, property_id, start_date, end_date, urls=None):
-    """
-    Detailed page performance with device and traffic source breakdown.
-    Filters by exact URL path match only (no startswith).
-    """
+    print(f"[DEBUG] get_page_performance | {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} | urls={urls}", flush=True)
+
     dimensions = [
         "pagePath", "deviceCategory", "sessionSource",
         "sessionMedium", "sessionDefaultChannelGroup"
@@ -235,20 +219,16 @@ def get_page_performance(client, property_id, start_date, end_date, urls=None):
 
     rows = run_ga4_report(client, property_id, dimensions, metrics, start_date, end_date)
 
-    # FIX: Use exact path matching only (no startswith)
-    # This prevents / from matching every page on the site
     if urls:
         url_paths = set()
         for u in urls:
             path = urlparse(u).path.rstrip('/') or '/'
             url_paths.add(path)
+        print(f"[DEBUG] filtering rows to url_paths={url_paths} | total rows before filter={len(rows)}", flush=True)
         if url_paths:
-            # Always assign filtered result — even if empty.
-            # Never fall back to all pages, as that causes site-wide data
-            # to be misattributed to specific requested URLs.
             rows = [r for r in rows if r['pagePath'].rstrip('/') in url_paths]
+        print(f"[DEBUG] rows after filter={len(rows)}", flush=True)
 
-    # Aggregate by page
     pages = {}
     for row in rows:
         path = row['pagePath']
@@ -285,7 +265,6 @@ def get_page_performance(client, property_id, start_date, end_date, urls=None):
         ch = row['sessionDefaultChannelGroup']
         p["channels"][ch] = p["channels"].get(ch, 0) + s
 
-    # Calculate weighted averages
     for path, p in pages.items():
         t = p["sessions"]
         if t > 0:
@@ -299,11 +278,12 @@ def get_page_performance(client, property_id, start_date, end_date, urls=None):
             if key.startswith("_"):
                 del p[key]
 
-    return list(pages.values())
+    result = list(pages.values())
+    print(f"[DEBUG] get_page_performance result: {[(p['pagePath'], p['sessions']) for p in result]}", flush=True)
+    return result
 
 
 def get_event_data(client, property_id, start_date, end_date, urls=None):
-    """Get top events and their frequency. If urls provided, filtered to those pages."""
     dimensions = ["eventName", "pagePath"] if urls else ["eventName"]
     rows = run_ga4_report(
         client, property_id,
@@ -320,7 +300,6 @@ def get_event_data(client, property_id, start_date, end_date, urls=None):
             path = urlparse(u).path.rstrip('/') or '/'
             url_paths.add(path)
         rows = [r for r in rows if r.get('pagePath', '').rstrip('/') in url_paths]
-        # Aggregate back to eventName only
         agg = {}
         for r in rows:
             name = r['eventName']
@@ -334,7 +313,6 @@ def get_event_data(client, property_id, start_date, end_date, urls=None):
 
 
 def get_landing_pages(client, property_id, start_date, end_date, urls=None):
-    """Get landing page performance. If urls provided, filtered to those pages."""
     rows = run_ga4_report(
         client, property_id,
         dimensions=["landingPage", "sessionDefaultChannelGroup"],
@@ -352,7 +330,6 @@ def get_landing_pages(client, property_id, start_date, end_date, urls=None):
 
 
 def get_exit_pages(client, property_id, start_date, end_date):
-    """Get exit page data."""
     rows = run_ga4_report(
         client, property_id,
         dimensions=["pagePath"],
@@ -364,7 +341,6 @@ def get_exit_pages(client, property_id, start_date, end_date):
 
 
 def get_geographic_data(client, property_id, start_date, end_date):
-    """Get geographic breakdown."""
     return run_ga4_report(
         client, property_id,
         dimensions=["country", "city"],
@@ -375,7 +351,6 @@ def get_geographic_data(client, property_id, start_date, end_date):
 
 
 def get_time_of_day(client, property_id, start_date, end_date):
-    """Get traffic patterns by hour and day of week."""
     return run_ga4_report(
         client, property_id,
         dimensions=["hour", "dayOfWeek"],
@@ -385,7 +360,6 @@ def get_time_of_day(client, property_id, start_date, end_date):
 
 
 def get_user_acquisition(client, property_id, start_date, end_date, urls=None):
-    """Get acquisition channel performance. If urls provided, filtered to those pages."""
     dimensions = ["sessionDefaultChannelGroup", "sessionSource", "sessionMedium", "pagePath"] if urls else \
                  ["sessionDefaultChannelGroup", "sessionSource", "sessionMedium"]
     rows = run_ga4_report(
@@ -401,7 +375,6 @@ def get_user_acquisition(client, property_id, start_date, end_date, urls=None):
             path = urlparse(u).path.rstrip('/') or '/'
             url_paths.add(path)
         rows = [r for r in rows if r.get('pagePath', '').rstrip('/') in url_paths]
-        # Aggregate back to channel/source/medium only
         agg = {}
         for r in rows:
             key = (r['sessionDefaultChannelGroup'], r['sessionSource'], r['sessionMedium'])
@@ -432,7 +405,6 @@ def get_user_acquisition(client, property_id, start_date, end_date, urls=None):
 
 
 def get_site_totals(client, property_id, start_date, end_date):
-    """Get overall site-level totals (no page dimension)."""
     rows = run_ga4_report(
         client, property_id,
         dimensions=[],
@@ -448,12 +420,6 @@ def get_site_totals(client, property_id, start_date, end_date):
 
 
 def aggregate_pages_to_totals(pages):
-    """
-    Aggregate a list of page-level dicts (from get_page_performance)
-    into a single totals dict matching the shape returned by get_site_totals.
-    Used when URLs are specified so that period-level trends reflect only
-    the requested pages rather than the whole site.
-    """
     if not pages:
         return {}
 
@@ -490,13 +456,8 @@ def aggregate_pages_to_totals(pages):
 # ============================================================
 
 def collect_all_data(client, property_id, urls=None):
-    """
-    Collect GA4 data across three reporting blocks:
-    - Last 7 days: standalone snapshot, no comparison
-    - Last 28 days vs previous 28 days (same period last month)
-    - Last 28 days vs same 28 days last year (YoY)
-    """
     now = datetime.now()
+    print(f"[DEBUG] collect_all_data | property_id={property_id} | urls={urls} | now={now.strftime('%Y-%m-%d %H:%M')}", flush=True)
 
     periods = {
         "last_7_days": {
@@ -522,7 +483,6 @@ def collect_all_data(client, property_id, urls=None):
 
     all_data = {}
 
-    # ── last_28_days and year_over_year: compute totals with comparisons ──
     for period_key in ["last_28_days", "year_over_year"]:
         period = periods[period_key]
         cs = period["current_start"]
@@ -530,7 +490,8 @@ def collect_all_data(client, property_id, urls=None):
         ps = period["previous_start"]
         pe = period["previous_end"]
 
-        # When specific URLs are requested, compute totals from those pages only
+        print(f"[DEBUG] {period_key} | current={cs.strftime('%Y-%m-%d')} to {ce.strftime('%Y-%m-%d')} | previous={ps.strftime('%Y-%m-%d')} to {pe.strftime('%Y-%m-%d')}", flush=True)
+
         if urls:
             current_pages = get_page_performance(client, property_id, cs, ce, urls)
             previous_pages = get_page_performance(client, property_id, ps, pe, urls)
@@ -539,6 +500,8 @@ def collect_all_data(client, property_id, urls=None):
         else:
             current_totals = get_site_totals(client, property_id, cs, ce)
             previous_totals = get_site_totals(client, property_id, ps, pe)
+
+        print(f"[DEBUG] {period_key} current_totals sessions={current_totals.get('sessions', 'N/A')} | previous_totals sessions={previous_totals.get('sessions', 'N/A')}", flush=True)
 
         changes = {}
         for metric in current_totals:
@@ -564,10 +527,9 @@ def collect_all_data(client, property_id, urls=None):
             "totals": changes
         }
 
-    # Detailed data for primary period (last 28 days)
-    # ── 7-day standalone block ──────────────────────────────
     cs7 = periods["last_7_days"]["current_start"]
     ce7 = periods["last_7_days"]["current_end"]
+    print(f"[DEBUG] last_7_days | {cs7.strftime('%Y-%m-%d')} to {ce7.strftime('%Y-%m-%d')}", flush=True)
     all_data["last_7_days"] = {
         "label": periods["last_7_days"]["label"],
         "page_performance": get_page_performance(client, property_id, cs7, ce7, urls),
@@ -575,7 +537,6 @@ def collect_all_data(client, property_id, urls=None):
         "geographic": get_geographic_data(client, property_id, cs7, ce7),
     }
 
-    # ── 28-day detailed data (current vs previous) ──────────
     cs28 = periods["last_28_days"]["current_start"]
     ce28 = periods["last_28_days"]["current_end"]
     ps28 = periods["last_28_days"]["previous_start"]
@@ -592,11 +553,11 @@ def collect_all_data(client, property_id, urls=None):
     all_data["time_of_day"] = get_time_of_day(client, property_id, cs28, ce28)
     all_data["acquisition"] = get_user_acquisition(client, property_id, cs28, ce28, urls)
 
-    # ── YoY: same 28-day window last year ───────────────────
     cs_yoy = periods["year_over_year"]["previous_start"]
     ce_yoy = periods["year_over_year"]["previous_end"]
     all_data["page_performance_yoy"] = get_page_performance(client, property_id, cs_yoy, ce_yoy, urls)
 
+    print(f"[DEBUG] collect_all_data complete", flush=True)
     return all_data, periods
 
 
@@ -605,13 +566,8 @@ def collect_all_data(client, property_id, urls=None):
 # ============================================================
 
 def build_data_summary(all_data, periods, urls=None):
-    """
-    Build a structured text summary of all GA4 data for the AI prompt.
-    Three blocks: 7-day snapshot, 28-day vs last month, 28-day vs last year.
-    """
     lines = []
 
-    # ── BLOCK 1: Last 7 days standalone ─────────────────────
     lines.append("=" * 60)
     lines.append(f"BLOCK 1 — {all_data.get('last_7_days', {}).get('label', 'Last 7 days')} — STANDALONE SNAPSHOT (no comparison)")
     lines.append("=" * 60)
@@ -646,7 +602,6 @@ def build_data_summary(all_data, periods, urls=None):
         for g in sorted(geo_7d, key=lambda x: x['sessions'], reverse=True)[:5]:
             lines.append(f"    {g['city']}, {g['country']}: {g['sessions']:,} sessions (engagement: {g['engagementRate']:.1%})")
 
-    # ── BLOCK 2: Last 28 days vs previous 28 days ────────────
     lines.append("\n" + "=" * 60)
     lines.append("BLOCK 2 — LAST 28 DAYS vs PREVIOUS 28 DAYS (same period last month)")
     lines.append("=" * 60)
@@ -701,7 +656,6 @@ def build_data_summary(all_data, periods, urls=None):
             lines.append(f"    vs previous 28 days: sessions {s_change:+,} ({s_pct:+.1f}%), "
                          f"bounce {page['bounceRate'] - prev['bounceRate']:+.1%}")
 
-    # ── BLOCK 3: Last 28 days vs same period last year ───────
     lines.append("\n" + "=" * 60)
     lines.append("BLOCK 3 — LAST 28 DAYS vs SAME PERIOD LAST YEAR (year-on-year)")
     lines.append("=" * 60)
@@ -735,7 +689,6 @@ def build_data_summary(all_data, periods, urls=None):
         lines.append(f"    Bounce: {page['bounceRate']:.1%} | Engagement: {page['engagementRate']:.1%}")
         lines.append(f"    Avg duration: {page['averageSessionDuration']:.1f}s")
 
-    # ── Supporting data ──────────────────────────────────────
     lines.append("\n" + "=" * 60)
     lines.append("USER EVENTS (last 28 days, excluding default GA4 events)")
     lines.append("=" * 60)
@@ -830,10 +783,6 @@ def build_data_summary(all_data, periods, urls=None):
 
 
 def analyze_with_claude(all_data, periods, claude_api_key, urls=None, context=None):
-    """
-    Send comprehensive GA4 data to Claude for analysis.
-    Returns the AI analysis as a string.
-    """
     try:
         client = anthropic.Anthropic(api_key=claude_api_key)
 
@@ -855,7 +804,6 @@ IMPORTANT FORMATTING RULES:
 - Do NOT use markdown formatting. Only HTML.
 - Do NOT include <html>, <head>, or <body> tags — just the content HTML."""
 
-        # Detect if this is a multi-location gym/venue report
         is_location_report = urls and len(urls) > 3 and all('find-a-gym' in u or 'location' in u or 'club' in u for u in urls[:3])
         location_context = """
 IMPORTANT: The URLs being analysed are individual gym/venue location pages. Each page represents a physical location.
@@ -960,10 +908,6 @@ CRITICAL RULES:
 # ============================================================
 
 def generate_charts(all_data):
-    """
-    Generate charts from GA4 data using Plotly.
-    Returns dict of base64-encoded PNG images.
-    """
     charts = {}
 
     try:
@@ -1082,7 +1026,7 @@ def generate_charts(all_data):
             charts['engagement_chart'] = base64.b64encode(img).decode()
 
     except Exception as e:
-        print(f"Error generating charts: {str(e)}")
+        print(f"Error generating charts: {str(e)}", flush=True)
 
     return charts
 
@@ -1093,23 +1037,7 @@ def generate_charts(all_data):
 
 @app.route('/analyze-with-ai', methods=['POST'])
 def analyze_with_ai():
-    """
-    Enhanced endpoint with multi-period comparison and rich AI analysis.
-
-    Expected JSON payload:
-    {
-        "property_id": "123456789",
-        "credentials": { GA4 service account JSON },
-        "urls": ["https://example.com/page1"],   // single URL, list, or newline-separated string
-        "days_back": 7,
-        "claude_api_key": "sk-ant-...",
-        "context": "Optional business context about this client"
-    }
-    """
     try:
-        # Read raw body and strip control characters before JSON parsing
-        # This handles newlines inside Tally URL fields and credentials
-        # that would otherwise cause "bad control character" errors in Make
         raw_body = request.get_data(as_text=True)
         raw_body = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', raw_body)
         data = json.loads(raw_body) if raw_body else None
@@ -1123,42 +1051,37 @@ def analyze_with_ai():
 
         property_id = data.get('property_id')
         credentials_dict = data.get('credentials')
-        # Handle credentials arriving as a string (from Make data structure mode)
         if isinstance(credentials_dict, str):
             credentials_dict = json.loads(credentials_dict)
         context = data.get('context', '')
 
-        # FIX: Sanitise and normalise incoming URLs
-        # Handles newline-separated strings from Tally, lists, and control characters
         raw_urls = data.get('urls', [])
         urls = sanitise_url_list(raw_urls)
+
+        print(f"[DEBUG] /analyze-with-ai received | property_id={property_id} | urls={urls}", flush=True)
 
         if not property_id or not credentials_dict:
             return jsonify({"error": "property_id and credentials are required"}), 400
 
-        # Authenticate
         credentials = service_account.Credentials.from_service_account_info(
             credentials_dict,
             scopes=['https://www.googleapis.com/auth/analytics.readonly']
         )
         ga4_client = BetaAnalyticsDataClient(credentials=credentials)
 
-        # Collect all data across multiple periods
         all_data, periods = collect_all_data(ga4_client, property_id, urls)
 
-        # Get AI analysis
         ai_insights = analyze_with_claude(all_data, periods, claude_api_key, urls, context)
 
-        # Sanitise AI insights for JSON safety
         if isinstance(ai_insights, str):
             ai_insights = ai_insights.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
             ai_insights = re.sub(r'[\x00-\x1f\x7f]', '', ai_insights)
             ai_insights = re.sub(r' {2,}', ' ', ai_insights)
 
-        # Generate charts
         charts = generate_charts(all_data)
 
         now = datetime.now()
+        print(f"[DEBUG] /analyze-with-ai complete | returning response", flush=True)
         return jsonify({
             "success": True,
             "property_id": property_id,
@@ -1174,11 +1097,13 @@ def analyze_with_ai():
 
     except Exception as e:
         import traceback
+        tb = traceback.format_exc()
+        print(f"[DEBUG] /analyze-with-ai ERROR: {str(e)}\n{tb}", flush=True)
         return jsonify({
             "success": False,
             "error": str(e),
             "error_type": type(e).__name__,
-            "traceback": traceback.format_exc()
+            "traceback": tb
         }), 500
 
 
