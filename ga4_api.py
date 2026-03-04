@@ -142,18 +142,17 @@ def aggregate_basic(results):
 # GA4 DATA COLLECTION FUNCTIONS
 # ============================================================
 
-def build_url_filter(url_paths):
+def build_url_filter(url_paths, field_name="pagePath"):
     """
     Build a GA4 dimension filter that matches any of the given URL paths exactly.
     Uses IN_LIST filter when multiple paths, EXACT when single.
     """
-    # Normalise: strip trailing slashes, ensure leading slash
     paths = list({p.rstrip('/') or '/' for p in url_paths})
 
     if len(paths) == 1:
         return FilterExpression(
             filter=Filter(
-                field_name="pagePath",
+                field_name=field_name,
                 string_filter=Filter.StringFilter(
                     match_type=Filter.StringFilter.MatchType.EXACT,
                     value=paths[0],
@@ -167,7 +166,7 @@ def build_url_filter(url_paths):
                 expressions=[
                     FilterExpression(
                         filter=Filter(
-                            field_name="pagePath",
+                            field_name=field_name,
                             string_filter=Filter.StringFilter(
                                 match_type=Filter.StringFilter.MatchType.EXACT,
                                 value=p,
@@ -196,6 +195,7 @@ def run_ga4_report(client, property_id, dimensions, metrics, start_date, end_dat
         )],
         limit=limit
     )
+
     if url_filter is not None:
         kwargs['dimension_filter'] = url_filter
 
@@ -231,16 +231,65 @@ def sanitise_url_list(raw_urls):
     return cleaned
 
 
+def get_url_paths(urls):
+    """Convert a list of full URLs to normalised path strings."""
+    paths = set()
+    for u in urls:
+        path = urlparse(u).path.rstrip('/') or '/'
+        paths.add(path)
+    return paths
+
+
+def get_device_breakdown(client, property_id, start_date, end_date, urls=None):
+    """
+    Fetch sessions broken down by device category.
+    Uses only 'sessions' as the metric — sessions are safely additive across
+    device rows, unlike totalUsers which would be double-counted.
+    Returns a dict: { pagePath: { device: sessions } }
+    """
+    url_filter = None
+    if urls:
+        url_paths = get_url_paths(urls)
+        url_filter = build_url_filter(url_paths, field_name="pagePath")
+
+    rows = run_ga4_report(
+        client, property_id,
+        dimensions=["pagePath", "deviceCategory"],
+        metrics=["sessions"],
+        start_date=start_date, end_date=end_date,
+        limit=10000,
+        url_filter=url_filter
+    )
+
+    devices_by_page = {}
+    for row in rows:
+        path = row['pagePath']
+        if path not in devices_by_page:
+            devices_by_page[path] = {}
+        dev = row['deviceCategory']
+        devices_by_page[path][dev] = devices_by_page[path].get(dev, 0) + row['sessions']
+
+    return devices_by_page
+
+
 def get_page_performance(client, property_id, start_date, end_date, urls=None):
     """
-    Detailed page performance filtered at the GA4 API level using dimension filters.
-    This avoids the row-limit issue where fetching all pages and filtering afterwards
-    would miss rows when the site has >10k page/device/source combinations.
+    Detailed page performance filtered at the GA4 API level.
+
+    FIX: deviceCategory has been removed from the dimensions here.
+    Previously, querying pagePath + deviceCategory + source/medium meant GA4
+    returned one row per (page × device × source) combination. Summing
+    totalUsers across those rows caused double/triple counting — a user visiting
+    on desktop AND mobile was counted twice. Sessions are additive across devices
+    but users are not.
+
+    Device breakdown is now fetched separately via get_device_breakdown(), which
+    only sums sessions (safe to aggregate) and never touches user counts.
     """
     print(f"[DEBUG] get_page_performance | {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} | urls={urls}", flush=True)
 
     dimensions = [
-        "pagePath", "deviceCategory", "sessionSource",
+        "pagePath", "sessionSource",
         "sessionMedium", "sessionDefaultChannelGroup"
     ]
     metrics = [
@@ -251,14 +300,11 @@ def get_page_performance(client, property_id, start_date, end_date, urls=None):
         "eventCount"
     ]
 
-    # Build API-level filter if URLs are specified
     url_filter = None
     url_paths = set()
     if urls:
-        for u in urls:
-            path = urlparse(u).path.rstrip('/') or '/'
-            url_paths.add(path)
-        url_filter = build_url_filter(url_paths)
+        url_paths = get_url_paths(urls)
+        url_filter = build_url_filter(url_paths, field_name="pagePath")
         print(f"[DEBUG] applying GA4 dimension filter for paths={url_paths}", flush=True)
 
     rows = run_ga4_report(
@@ -269,7 +315,10 @@ def get_page_performance(client, property_id, start_date, end_date, urls=None):
     )
     print(f"[DEBUG] GA4 returned {len(rows)} rows", flush=True)
 
-    # Aggregate by page
+    # Fetch device breakdown separately (sessions only — safe to sum)
+    devices_by_page = get_device_breakdown(client, property_id, start_date, end_date, urls)
+
+    # Aggregate by page across source/medium combinations
     pages = {}
     for row in rows:
         path = row['pagePath']
@@ -279,7 +328,7 @@ def get_page_performance(client, property_id, start_date, end_date, urls=None):
                 "sessions": 0, "totalUsers": 0, "newUsers": 0,
                 "engagedSessions": 0, "eventCount": 0,
                 "userEngagementDuration": 0,
-                "devices": {}, "sources": {}, "channels": {},
+                "sources": {}, "channels": {},
                 "_weighted_bounce": 0, "_weighted_duration": 0,
                 "_weighted_pages_per_session": 0, "_weighted_engagement_rate": 0,
             }
@@ -297,9 +346,6 @@ def get_page_performance(client, property_id, start_date, end_date, urls=None):
         p["_weighted_pages_per_session"] += row['screenPageViewsPerSession'] * s
         p["_weighted_engagement_rate"] += row['engagementRate'] * s
 
-        dev = row['deviceCategory']
-        p["devices"][dev] = p["devices"].get(dev, 0) + s
-
         src = f"{row['sessionSource']} / {row['sessionMedium']}"
         p["sources"][src] = p["sources"].get(src, 0) + s
 
@@ -315,23 +361,22 @@ def get_page_performance(client, property_id, start_date, end_date, urls=None):
             p["engagementRate"] = round(p["_weighted_engagement_rate"] / t, 4)
             p["avgEngagementDuration"] = round(p["userEngagementDuration"] / t, 2)
             p["returningUsers"] = p["totalUsers"] - p["newUsers"]
+        # Attach device breakdown from the separate safe query
+        p["devices"] = devices_by_page.get(path, {})
         for key in list(p.keys()):
             if key.startswith("_"):
                 del p[key]
 
     result = list(pages.values())
-    print(f"[DEBUG] get_page_performance result: {[(p['pagePath'], p['sessions']) for p in result]}", flush=True)
+    print(f"[DEBUG] get_page_performance result: {[(p['pagePath'], p['sessions'], p['totalUsers']) for p in result]}", flush=True)
     return result
 
 
 def get_event_data(client, property_id, start_date, end_date, urls=None):
     url_filter = None
     if urls:
-        url_paths = set()
-        for u in urls:
-            path = urlparse(u).path.rstrip('/') or '/'
-            url_paths.add(path)
-        url_filter = build_url_filter(url_paths)
+        url_paths = get_url_paths(urls)
+        url_filter = build_url_filter(url_paths, field_name="pagePath")
 
     dimensions = ["eventName", "pagePath"] if urls else ["eventName"]
     rows = run_ga4_report(
@@ -360,41 +405,8 @@ def get_event_data(client, property_id, start_date, end_date, urls=None):
 def get_landing_pages(client, property_id, start_date, end_date, urls=None):
     url_filter = None
     if urls:
-        url_paths = set()
-        for u in urls:
-            path = urlparse(u).path.rstrip('/') or '/'
-            url_paths.add(path)
-        # Landing page dimension is "landingPage" not "pagePath" — build filter manually
-        paths = list(url_paths)
-        if len(paths) == 1:
-            url_filter = FilterExpression(
-                filter=Filter(
-                    field_name="landingPage",
-                    string_filter=Filter.StringFilter(
-                        match_type=Filter.StringFilter.MatchType.EXACT,
-                        value=paths[0],
-                        case_sensitive=False
-                    )
-                )
-            )
-        else:
-            url_filter = FilterExpression(
-                or_group=FilterExpressionList(
-                    expressions=[
-                        FilterExpression(
-                            filter=Filter(
-                                field_name="landingPage",
-                                string_filter=Filter.StringFilter(
-                                    match_type=Filter.StringFilter.MatchType.EXACT,
-                                    value=p,
-                                    case_sensitive=False
-                                )
-                            )
-                        )
-                        for p in paths
-                    ]
-                )
-            )
+        url_paths = get_url_paths(urls)
+        url_filter = build_url_filter(url_paths, field_name="landingPage")
 
     rows = run_ga4_report(
         client, property_id,
@@ -439,11 +451,8 @@ def get_time_of_day(client, property_id, start_date, end_date):
 def get_user_acquisition(client, property_id, start_date, end_date, urls=None):
     url_filter = None
     if urls:
-        url_paths = set()
-        for u in urls:
-            path = urlparse(u).path.rstrip('/') or '/'
-            url_paths.add(path)
-        url_filter = build_url_filter(url_paths)
+        url_paths = get_url_paths(urls)
+        url_filter = build_url_filter(url_paths, field_name="pagePath")
 
     dimensions = ["sessionDefaultChannelGroup", "sessionSource", "sessionMedium", "pagePath"] if urls else \
                  ["sessionDefaultChannelGroup", "sessionSource", "sessionMedium"]
@@ -581,7 +590,7 @@ def collect_all_data(client, property_id, urls=None):
             current_totals = get_site_totals(client, property_id, cs, ce)
             previous_totals = get_site_totals(client, property_id, ps, pe)
 
-        print(f"[DEBUG] {period_key} current_totals sessions={current_totals.get('sessions', 'N/A')} | previous_totals sessions={previous_totals.get('sessions', 'N/A')}", flush=True)
+        print(f"[DEBUG] {period_key} current_totals sessions={current_totals.get('sessions', 'N/A')} totalUsers={current_totals.get('totalUsers', 'N/A')} | previous_totals sessions={previous_totals.get('sessions', 'N/A')}", flush=True)
 
         changes = {}
         for metric in current_totals:
@@ -1015,6 +1024,7 @@ def generate_charts(all_data):
             img = pio.to_image(fig5, format='png', width=800, height=max(300, len(pages_sorted) * 50 + 100))
             charts['engagement_chart'] = base64.b64encode(img).decode()
 
+        # Device chart: aggregate across all pages using the separately fetched device data
         device_totals = {}
         for page in current_pages:
             for dev, sess in page.get('devices', {}).items():
